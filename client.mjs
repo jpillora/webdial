@@ -1,5 +1,15 @@
-// webdial ESM client — zero dependencies, Node.js 22+
+// webdial ESM client — zero dependencies, browser + Node.js 22+
 // Implements net.Conn-like interface over WebSocket with SSE+POST fallback.
+
+/** Decode a base64 string (handles unpadded) to Uint8Array. */
+function base64Decode(str) {
+  // Add padding if needed
+  while (str.length % 4 !== 0) str += "=";
+  const bin = atob(str);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
 
 /**
  * Dial connects to a webdial server.
@@ -191,7 +201,7 @@ class SSEConn {
         this.#closed = true;
         return null;
       }
-      if (ev.event === "d") return Buffer.from(ev.data, "base64");
+      if (ev.event === "d") return base64Decode(ev.data);
       if (ev.event === "close") {
         this.#closed = true;
         return null;

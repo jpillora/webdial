@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>webdial example</title>
+<style>
+  body { font-family: monospace; max-width: 600px; margin: 2em auto; }
+  #log { border: 1px solid #ccc; padding: 0.5em; height: 300px; overflow-y: auto; white-space: pre-wrap; }
+  .sent { color: blue; }
+  .recv { color: green; }
+  .err  { color: red; }
+  .info { color: gray; }
+  fieldset { margin-bottom: 1em; }
+</style>
+</head>
+<body>
+<h2>webdial echo</h2>
+<fieldset>
+  <legend>transport</legend>
+  <label><input type="radio" name="transport" value="auto" checked> auto</label>
+  <label><input type="radio" name="transport" value="ws"> ws</label>
+  <label><input type="radio" name="transport" value="sse"> sse</label>
+</fieldset>
+<button id="connect">Connect</button>
+<span id="status"></span>
+<br><br>
+<input id="msg" type="text" value="hello" size="40" disabled>
+<button id="send" disabled>Send</button>
+<button id="sendbin" disabled>Send binary</button>
+<div id="log"></div>
+
+<script type="module">
+import { dial } from "/client.mjs";
+
+const log = document.getElementById("log");
+const msgInput = document.getElementById("msg");
+const sendBtn = document.getElementById("send");
+const sendBinBtn = document.getElementById("sendbin");
+const connectBtn = document.getElementById("connect");
+const statusEl = document.getElementById("status");
+
+let conn = null;
+
+function appendLog(cls, text) {
+  const span = document.createElement("span");
+  span.className = cls;
+  span.textContent = text + "\n";
+  log.appendChild(span);
+  log.scrollTop = log.scrollHeight;
+}
+
+connectBtn.onclick = async () => {
+  const transport = document.querySelector('input[name="transport"]:checked').value;
+  const opts = transport === "auto" ? {} : { transport };
+  connectBtn.disabled = true;
+  statusEl.textContent = "connecting...";
+  try {
+    conn = await dial(location.origin + "/wd", opts);
+    statusEl.textContent = `connected (${conn.transport})`;
+    appendLog("info", `connected via ${conn.transport}`);
+    msgInput.disabled = false;
+    sendBtn.disabled = false;
+    sendBinBtn.disabled = false;
+    readLoop();
+  } catch (e) {
+    statusEl.textContent = "failed";
+    appendLog("err", `connect error: ${e.message}`);
+    connectBtn.disabled = false;
+  }
+};
+
+async function readLoop() {
+  while (true) {
+    const data = await conn.read();
+    if (data === null) {
+      appendLog("info", "connection closed");
+      msgInput.disabled = true;
+      sendBtn.disabled = true;
+      sendBinBtn.disabled = true;
+      connectBtn.disabled = false;
+      statusEl.textContent = "disconnected";
+      break;
+    }
+    const text = new TextDecoder().decode(data);
+    appendLog("recv", `recv: ${text}`);
+  }
+}
+
+sendBtn.onclick = () => {
+  if (!conn) return;
+  const text = msgInput.value;
+  conn.write(text);
+  appendLog("sent", `sent: ${text}`);
+};
+
+sendBinBtn.onclick = () => {
+  if (!conn) return;
+  const bytes = new Uint8Array([0x00, 0x01, 0x02, 0xFE, 0xFF]);
+  conn.write(bytes);
+  appendLog("sent", `sent binary: [${bytes.join(", ")}]`);
+};
+</script>
+</body>
+</html>

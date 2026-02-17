@@ -2,7 +2,6 @@ package webdial
 
 import (
 	"context"
-	"net/http"
 	"net/http/httptest"
 	"testing"
 
@@ -12,7 +11,7 @@ import (
 func TestWSTransport(t *testing.T) {
 	srv := NewServer()
 	defer srv.Close()
-	ts := httptest.NewServer(srv.Handler())
+	ts := httptest.NewServer(srv)
 	defer ts.Close()
 	go func() {
 		conn, err := srv.Accept()
@@ -39,14 +38,7 @@ func TestWSTransport(t *testing.T) {
 func TestSSETransport(t *testing.T) {
 	srv := NewServer()
 	defer srv.Close()
-	mux := http.NewServeMux()
-	mux.Handle("/sse", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		srv.Handler().ServeHTTP(w, r)
-	}))
-	mux.Handle("/post", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		srv.Handler().ServeHTTP(w, r)
-	}))
-	ts := httptest.NewServer(mux)
+	ts := httptest.NewServer(srv)
 	defer ts.Close()
 	go func() {
 		conn, err := srv.Accept()

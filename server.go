@@ -30,16 +30,7 @@ func NewServer() *Server {
 	}
 }
 
-func (s *Server) Handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /ws", s.handleWS)
-	mux.HandleFunc("GET /sse", s.handleSSE)
-	mux.HandleFunc("POST /post", s.handlePost)
-	mux.HandleFunc("/", s.handleRoot)
-	return mux
-}
-
-func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get("Upgrade") != "" {
 		s.handleWS(w, r)
 		return
