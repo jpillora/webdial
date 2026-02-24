@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/jpillora/eventsource"
@@ -107,10 +108,21 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		s.sessions.Delete(sid)
 		return
 	}
-	select {
-	case <-r.Context().Done():
-	case <-conn.closeCh:
-	case <-s.closed:
+	ticker := time.NewTicker(25 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if err := conn.writeHeartbeat(); err != nil {
+				return
+			}
+		case <-r.Context().Done():
+			return
+		case <-conn.closeCh:
+			return
+		case <-s.closed:
+			return
+		}
 	}
 	s.sessions.Delete(sid)
 	pw.Close()

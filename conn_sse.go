@@ -142,6 +142,15 @@ func (c *sseServerConn) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
+func (c *sseServerConn) writeHeartbeat() error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.closed.Load() {
+		return io.ErrClosedPipe
+	}
+	return eventsource.WriteEvent(c.w, eventsource.Event{Type: "ping"})
+}
+
 func (c *sseServerConn) Close() error {
 	if c.closed.Swap(true) {
 		return nil
