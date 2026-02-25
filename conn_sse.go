@@ -72,7 +72,7 @@ func (c *sseClientConn) Write(b []byte) (int, error) {
 	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	url := c.baseURL + "/post?s=" + c.sessionID
+	url := c.baseURL + "?s=" + c.sessionID
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url, bytes.NewReader(b))
 	if err != nil {
 		return 0, err
@@ -95,7 +95,7 @@ func (c *sseClientConn) Close() error {
 	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	url := c.baseURL + "/post?s=" + c.sessionID + "&close=1"
+	url := c.baseURL + "?s=" + c.sessionID + "&close=1"
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, url, nil)
 	resp, err := c.client.Do(req)
 	if err == nil {

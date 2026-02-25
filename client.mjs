@@ -33,8 +33,7 @@ export async function dial(baseURL, opts) {
 // --- WebSocket transport ---
 
 async function dialWS(baseURL) {
-  const wsURL =
-    baseURL.replace(/^https:/, "wss:").replace(/^http:/, "ws:") + "/ws";
+  const wsURL = baseURL.replace(/^https:/, "wss:").replace(/^http:/, "ws:");
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(wsURL);
     ws.binaryType = "arraybuffer";
@@ -119,7 +118,7 @@ class WSConn {
 // --- SSE + POST transport ---
 
 async function dialSSE(baseURL) {
-  const resp = await fetch(baseURL + "/sse", {
+  const resp = await fetch(baseURL, {
     headers: { Accept: "text/event-stream" },
   });
   if (!resp.ok) throw new Error(`webdial: sse returned ${resp.status}`);
@@ -213,7 +212,7 @@ class SSEConn {
   async write(data) {
     if (this.#closed) throw new Error("webdial: connection closed");
     if (typeof data === "string") data = new TextEncoder().encode(data);
-    const resp = await fetch(`${this.#baseURL}/post?s=${this.#sid}`, {
+    const resp = await fetch(`${this.#baseURL}?s=${this.#sid}`, {
       method: "POST",
       headers: { "Content-Type": "application/octet-stream" },
       body: data,
@@ -227,7 +226,7 @@ class SSEConn {
     if (this.#closed) return;
     this.#closed = true;
     try {
-      await fetch(`${this.#baseURL}/post?s=${this.#sid}&close=1`, {
+      await fetch(`${this.#baseURL}?s=${this.#sid}&close=1`, {
         method: "POST",
       });
     } catch {}

@@ -23,7 +23,6 @@ func Dial(ctx context.Context, baseURL string) (net.Conn, error) {
 func dialWS(ctx context.Context, baseURL string) (net.Conn, error) {
 	wsURL := strings.Replace(baseURL, "https://", "wss://", 1)
 	wsURL = strings.Replace(wsURL, "http://", "ws://", 1)
-	wsURL += "/ws"
 	dialer := websocket.Dialer{}
 	ws, _, err := dialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
@@ -33,7 +32,7 @@ func dialWS(ctx context.Context, baseURL string) (net.Conn, error) {
 }
 
 func dialSSE(ctx context.Context, baseURL string) (net.Conn, error) {
-	sseURL := baseURL + "/sse"
+	sseURL := baseURL
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sseURL, nil)
 	if err != nil {
 		return nil, err
