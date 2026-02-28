@@ -95,6 +95,10 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		remoteAddr: addr{transport: "sse", url: r.RemoteAddr},
 	}
 	s.sessions.Store(sid, &sseSession{conn: conn})
+	defer func() {
+		s.sessions.Delete(sid)
+		pw.Close()
+	}()
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	eventsource.WriteEvent(w, eventsource.Event{
@@ -105,7 +109,6 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	case s.acceptCh <- conn:
 	case <-s.closed:
 		conn.Close()
-		s.sessions.Delete(sid)
 		return
 	}
 	ticker := time.NewTicker(25 * time.Second)
@@ -124,8 +127,6 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	s.sessions.Delete(sid)
-	pw.Close()
 }
 
 func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
