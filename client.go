@@ -28,7 +28,7 @@ func dialWS(ctx context.Context, baseURL string) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newWSConn(ws), nil
+	return newWSConn(ws, -1), nil
 }
 
 func dialSSE(ctx context.Context, baseURL string) (net.Conn, error) {

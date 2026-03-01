@@ -10,13 +10,37 @@ import (
 )
 
 type wsConn struct {
-	ws     *websocket.Conn
-	reader io.Reader
-	mu     sync.Mutex
+	ws        *websocket.Conn
+	reader    io.Reader
+	mu        sync.Mutex
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
-func newWSConn(ws *websocket.Conn) net.Conn {
-	return &wsConn{ws: ws}
+func newWSConn(ws *websocket.Conn, keepAlive time.Duration) net.Conn {
+	c := &wsConn{
+		ws:   ws,
+		done: make(chan struct{}),
+	}
+	if keepAlive >= 0 {
+		go c.pingLoop(keepAlive)
+	}
+	return c
+}
+
+func (c *wsConn) pingLoop(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if err := c.ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
+				return
+			}
+		case <-c.done:
+			return
+		}
+	}
 }
 
 func (c *wsConn) Read(b []byte) (int, error) {
@@ -51,6 +75,9 @@ func (c *wsConn) Write(b []byte) (int, error) {
 }
 
 func (c *wsConn) Close() error {
+	c.closeOnce.Do(func() {
+		close(c.done)
+	})
 	return c.ws.Close()
 }
 

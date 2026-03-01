@@ -18,6 +18,9 @@ var upgrader = websocket.Upgrader{
 }
 
 type Server struct {
+	// KeepAlive is the interval between keep-alive pings.
+	// Zero means 25 seconds. Negative means disabled.
+	KeepAlive time.Duration
 	acceptCh  chan net.Conn
 	sessions  sync.Map // map[string]*sseSession
 	closed    chan struct{}
@@ -69,12 +72,19 @@ func (s *Server) Close() error {
 	return nil
 }
 
+func (s *Server) keepAliveInterval() time.Duration {
+	if s.KeepAlive == 0 {
+		return 25 * time.Second
+	}
+	return s.KeepAlive
+}
+
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
-	conn := newWSConn(ws)
+	conn := newWSConn(ws, s.keepAliveInterval())
 	select {
 	case s.acceptCh <- conn:
 	case <-s.closed:
@@ -111,7 +121,16 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		conn.Close()
 		return
 	}
-	ticker := time.NewTicker(25 * time.Second)
+	ka := s.keepAliveInterval()
+	if ka < 0 {
+		select {
+		case <-r.Context().Done():
+		case <-conn.closeCh:
+		case <-s.closed:
+		}
+		return
+	}
+	ticker := time.NewTicker(ka)
 	defer ticker.Stop()
 	for {
 		select {
