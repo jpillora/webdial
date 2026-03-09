@@ -125,6 +125,8 @@ func (c *sseServerConn) Read(b []byte) (int, error) {
 	return c.readPipe.Read(b)
 }
 
+// Write encodes b and writes it as an SSE event.
+// Note: eventsource.WriteEvent also flushes the http.ResponseWriter.
 func (c *sseServerConn) Write(b []byte) (int, error) {
 	if c.closed.Load() {
 		return 0, io.ErrClosedPipe
