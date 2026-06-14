@@ -57,11 +57,18 @@ class WSConn {
   #closed = false;
   #closeErr = null;
   #url;
+  #latency = null;
+  #pingTimer = null;
+  onLatency = null;
 
   constructor(ws, url) {
     this.#ws = ws;
     this.#url = url;
     ws.onmessage = (event) => {
+      if (typeof event.data === "string") {
+        this.#handleControl(event.data);
+        return;
+      }
       const data = new Uint8Array(event.data);
       if (this.#waiters.length > 0) {
         this.#waiters.shift().resolve(data);
@@ -71,15 +78,18 @@ class WSConn {
     };
     ws.onclose = () => {
       this.#closed = true;
+      this.#stopPing();
       for (const w of this.#waiters) w.resolve(null);
       this.#waiters = [];
     };
     ws.onerror = () => {
       this.#closed = true;
+      this.#stopPing();
       this.#closeErr = new Error("webdial: websocket error");
       for (const w of this.#waiters) w.reject(this.#closeErr);
       this.#waiters = [];
     };
+    this.#startPing();
   }
 
   /** @returns {Promise<Uint8Array|null>} null on EOF/close */
@@ -104,9 +114,38 @@ class WSConn {
   async close() {
     if (this.#closed) return;
     this.#closed = true;
+    this.#stopPing();
     this.#ws.close();
   }
 
+  #handleControl(text) {
+    if (text.startsWith("pong:")) {
+      const ts = parseFloat(text.slice(5));
+      if (!Number.isNaN(ts)) {
+        this.#latency = performance.now() - ts;
+        this.onLatency?.(this.#latency);
+      }
+    }
+  }
+
+  #startPing() {
+    this.#pingTimer = setInterval(() => {
+      try {
+        this.#ws.send("ping:" + performance.now());
+      } catch {}
+    }, 5000);
+  }
+
+  #stopPing() {
+    if (this.#pingTimer) {
+      clearInterval(this.#pingTimer);
+      this.#pingTimer = null;
+    }
+  }
+
+  get latency() {
+    return this.#latency;
+  }
   get transport() {
     return "ws";
   }
@@ -183,12 +222,19 @@ class SSEConn {
   #decoder;
   #closed = false;
   #url;
+  #postURL;
+  #latency = null;
+  #pingTimer = null;
+  onLatency = null;
 
   constructor(baseURL, sid, decoder) {
     this.#baseURL = baseURL;
     this.#sid = sid;
     this.#decoder = decoder;
     this.#url = baseURL;
+    const sep = baseURL.includes("?") ? "&" : "?";
+    this.#postURL = `${baseURL}${sep}s=${sid}`;
+    this.#startPing();
   }
 
   /** @returns {Promise<Uint8Array|null>} null on EOF/close */
@@ -198,11 +244,21 @@ class SSEConn {
       const ev = await this.#decoder.next();
       if (!ev) {
         this.#closed = true;
+        this.#stopPing();
         return null;
       }
       if (ev.event === "d") return base64Decode(ev.data);
+      if (ev.event === "pong") {
+        const ts = parseFloat(ev.data);
+        if (!Number.isNaN(ts)) {
+          this.#latency = performance.now() - ts;
+          this.onLatency?.(this.#latency);
+        }
+        continue;
+      }
       if (ev.event === "close") {
         this.#closed = true;
+        this.#stopPing();
         return null;
       }
     }
@@ -212,7 +268,7 @@ class SSEConn {
   async write(data) {
     if (this.#closed) throw new Error("webdial: connection closed");
     if (typeof data === "string") data = new TextEncoder().encode(data);
-    const resp = await fetch(`${this.#baseURL}?s=${this.#sid}`, {
+    const resp = await fetch(this.#postURL, {
       method: "POST",
       headers: { "Content-Type": "application/octet-stream" },
       body: data,
@@ -225,8 +281,9 @@ class SSEConn {
   async close() {
     if (this.#closed) return;
     this.#closed = true;
+    this.#stopPing();
     try {
-      await fetch(`${this.#baseURL}?s=${this.#sid}&close=1`, {
+      await fetch(`${this.#postURL}&close=1`, {
         method: "POST",
       });
     } catch {}
@@ -235,6 +292,24 @@ class SSEConn {
     } catch {}
   }
 
+  #startPing() {
+    this.#pingTimer = setInterval(() => {
+      fetch(`${this.#postURL}&ping=${performance.now()}`, {
+        method: "POST",
+      }).catch(() => {});
+    }, 5000);
+  }
+
+  #stopPing() {
+    if (this.#pingTimer) {
+      clearInterval(this.#pingTimer);
+      this.#pingTimer = null;
+    }
+  }
+
+  get latency() {
+    return this.#latency;
+  }
   get transport() {
     return "sse";
   }

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -18,6 +19,7 @@ type sseClientConn struct {
 	noopDeadline
 	baseURL    string
 	sessionID  string
+	postURL    string
 	sseResp    *http.Response
 	decoder    *eventsource.Decoder
 	readBuf    bytes.Buffer
@@ -29,9 +31,14 @@ type sseClientConn struct {
 }
 
 func newSSEClientConn(baseURL, sessionID string, sseResp *http.Response, decoder *eventsource.Decoder, client *http.Client) *sseClientConn {
+	sep := "?"
+	if strings.Contains(baseURL, "?") {
+		sep = "&"
+	}
 	return &sseClientConn{
 		baseURL:    baseURL,
 		sessionID:  sessionID,
+		postURL:    baseURL + sep + "s=" + sessionID,
 		sseResp:    sseResp,
 		decoder:    decoder,
 		client:     client,
@@ -72,7 +79,7 @@ func (c *sseClientConn) Write(b []byte) (int, error) {
 	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	url := c.baseURL + "?s=" + c.sessionID
+	url := c.postURL
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url, bytes.NewReader(b))
 	if err != nil {
 		return 0, err
@@ -95,7 +102,7 @@ func (c *sseClientConn) Close() error {
 	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	url := c.baseURL + "?s=" + c.sessionID + "&close=1"
+	url := c.postURL + "&close=1"
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, url, nil)
 	resp, err := c.client.Do(req)
 	if err == nil {
@@ -151,6 +158,17 @@ func (c *sseServerConn) writeHeartbeat() error {
 		return io.ErrClosedPipe
 	}
 	return eventsource.WriteEvent(c.w, eventsource.Event{Type: "ping"})
+}
+
+// writePong echoes a client-supplied timestamp back over the SSE stream so the
+// client can measure round-trip latency.
+func (c *sseServerConn) writePong(ts []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.closed.Load() {
+		return io.ErrClosedPipe
+	}
+	return eventsource.WriteEvent(c.w, eventsource.Event{Type: "pong", Data: ts})
 }
 
 func (c *sseServerConn) Close() error {

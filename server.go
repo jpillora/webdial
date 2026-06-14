@@ -165,6 +165,11 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	if ping := r.URL.Query().Get("ping"); ping != "" {
+		sess.conn.writePong([]byte(ping))
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "read error", http.StatusInternalServerError)

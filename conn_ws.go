@@ -1,6 +1,7 @@
 package webdial
 
 import (
+	"bytes"
 	"io"
 	"net"
 	"sync"
@@ -13,6 +14,7 @@ type wsConn struct {
 	ws        *websocket.Conn
 	reader    io.Reader
 	mu        sync.Mutex
+	writeMu   sync.Mutex
 	done      chan struct{}
 	closeOnce sync.Once
 }
@@ -48,9 +50,14 @@ func (c *wsConn) Read(b []byte) (int, error) {
 	defer c.mu.Unlock()
 	for {
 		if c.reader == nil {
-			_, r, err := c.ws.NextReader()
+			mt, r, err := c.ws.NextReader()
 			if err != nil {
 				return 0, err
+			}
+			if mt == websocket.TextMessage {
+				ctrl, _ := io.ReadAll(r)
+				c.handleControl(ctrl)
+				continue
 			}
 			c.reader = r
 		}
@@ -67,11 +74,27 @@ func (c *wsConn) Read(b []byte) (int, error) {
 }
 
 func (c *wsConn) Write(b []byte) (int, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	err := c.ws.WriteMessage(websocket.BinaryMessage, b)
 	if err != nil {
 		return 0, err
 	}
 	return len(b), nil
+}
+
+// handleControl responds to application-level text control frames. A "ping:<ts>"
+// frame is echoed back as "pong:<ts>" so the peer can measure round-trip latency.
+func (c *wsConn) handleControl(payload []byte) {
+	if ts, ok := bytes.CutPrefix(payload, []byte("ping:")); ok {
+		c.writeControl(append([]byte("pong:"), ts...))
+	}
+}
+
+func (c *wsConn) writeControl(payload []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.ws.WriteMessage(websocket.TextMessage, payload)
 }
 
 func (c *wsConn) Close() error {
