@@ -1,6 +1,35 @@
 {
   "name": "webdial",
-  "version": "0.0.0",
+  "version": "0.1.0",
+  "description": "net.Conn-style stream over HTTP for the browser and Node.js — WebSocket with SSE+POST fallback, zero dependencies",
   "type": "module",
-  "exports": "./client.mjs"
+  "exports": "./client.mjs",
+  "files": [
+    "client.mjs",
+    "README.md",
+    "screenshot.png"
+  ],
+  "keywords": [
+    "websocket",
+    "sse",
+    "server-sent-events",
+    "net.conn",
+    "stream",
+    "tunnel",
+    "transport",
+    "fallback"
+  ],
+  "author": "Jaime Pillora <dev@jpillora.com>",
+  "license": "MIT",
+  "homepage": "https://github.com/jpillora/webdial#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jpillora/webdial.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jpillora/webdial/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  }
 }
