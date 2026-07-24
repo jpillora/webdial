@@ -2,6 +2,7 @@ package webdial
 
 import (
 	"bytes"
+	"compress/flate"
 	"io"
 	"net"
 	"sync"
@@ -20,6 +21,8 @@ type wsConn struct {
 }
 
 func newWSConn(ws *websocket.Conn, keepAlive time.Duration) net.Conn {
+	ws.EnableWriteCompression(true)
+	_ = ws.SetCompressionLevel(flate.BestSpeed) // speed over ratio: real-time stream
 	c := &wsConn{
 		ws:   ws,
 		done: make(chan struct{}),

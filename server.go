@@ -14,7 +14,8 @@ import (
 )
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin:       func(r *http.Request) bool { return true },
+	EnableCompression: true, // per-message deflate (RFC 7692); browser decompresses natively
 }
 
 type Server struct {
