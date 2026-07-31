@@ -1,6 +1,7 @@
 package webdial
 
 import (
+	"compress/flate"
 	"context"
 	"fmt"
 	"net"
@@ -28,7 +29,7 @@ func dialWS(ctx context.Context, baseURL string) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newWSConn(ws, -1), nil
+	return newWSConn(ws, -1, flate.BestSpeed), nil
 }
 
 func dialSSE(ctx context.Context, baseURL string) (net.Conn, error) {

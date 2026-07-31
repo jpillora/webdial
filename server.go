@@ -1,6 +1,7 @@
 package webdial
 
 import (
+	"compress/flate"
 	"errors"
 	"io"
 	"net"
@@ -22,10 +23,13 @@ type Server struct {
 	// KeepAlive is the interval between keep-alive pings.
 	// Zero means 25 seconds. Negative means disabled.
 	KeepAlive time.Duration
-	acceptCh  chan net.Conn
-	sessions  sync.Map // map[string]*sseSession
-	closed    chan struct{}
-	closeOnce sync.Once
+	// CompressionLevel is the flate level for per-message WS compression
+	// (1-9, or flate.DefaultCompression). Zero means flate.BestSpeed.
+	CompressionLevel int
+	acceptCh         chan net.Conn
+	sessions         sync.Map // map[string]*sseSession
+	closed           chan struct{}
+	closeOnce        sync.Once
 }
 
 func NewServer() *Server {
@@ -80,12 +84,19 @@ func (s *Server) keepAliveInterval() time.Duration {
 	return s.KeepAlive
 }
 
+func (s *Server) compressionLevel() int {
+	if s.CompressionLevel == 0 {
+		return flate.BestSpeed
+	}
+	return s.CompressionLevel
+}
+
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
-	conn := newWSConn(ws, s.keepAliveInterval())
+	conn := newWSConn(ws, s.keepAliveInterval(), s.compressionLevel())
 	select {
 	case s.acceptCh <- conn:
 	case <-s.closed:
