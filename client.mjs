@@ -1,6 +1,14 @@
 // webdial ESM client — zero dependencies, browser + Node.js 22+
 // Implements net.Conn-like interface over WebSocket with SSE+POST fallback.
 
+const PING_INTERVAL_MS = 5000;
+// A transport that dies without a close handshake stays "open" as far as the
+// caller can tell, so writes keep succeeding into a peer that already forgot
+// us. An unanswered ping is the only evidence available. Timers are throttled
+// in background tabs, but message delivery is not, so a live peer still clears
+// this well before the deadline.
+const PONG_TIMEOUT_MS = 3 * PING_INTERVAL_MS;
+
 /** Decode a base64 string (handles unpadded) to Uint8Array. */
 function base64Decode(str) {
   // Add padding if needed
@@ -59,6 +67,7 @@ class WSConn {
   #url;
   #latency = null;
   #pingTimer = null;
+  #pingSentAt = null;
   onLatency = null;
 
   constructor(ws, url) {
@@ -120,6 +129,7 @@ class WSConn {
 
   #handleControl(text) {
     if (text.startsWith("pong:")) {
+      this.#pingSentAt = null;
       const ts = parseFloat(text.slice(5));
       if (!Number.isNaN(ts)) {
         this.#latency = performance.now() - ts;
@@ -130,10 +140,20 @@ class WSConn {
 
   #startPing() {
     this.#pingTimer = setInterval(() => {
+      if (this.#stale()) {
+        this.#ws.close();
+        return;
+      }
       try {
         this.#ws.send("ping:" + performance.now());
+        if (this.#pingSentAt === null) this.#pingSentAt = performance.now();
       } catch {}
-    }, 5000);
+    }, PING_INTERVAL_MS);
+  }
+
+  #stale() {
+    if (this.#pingSentAt === null) return false;
+    return performance.now() - this.#pingSentAt > PONG_TIMEOUT_MS;
   }
 
   #stopPing() {
@@ -225,6 +245,7 @@ class SSEConn {
   #postURL;
   #latency = null;
   #pingTimer = null;
+  #pingSentAt = null;
   onLatency = null;
 
   constructor(baseURL, sid, decoder) {
@@ -249,6 +270,7 @@ class SSEConn {
       }
       if (ev.event === "d") return base64Decode(ev.data);
       if (ev.event === "pong") {
+        this.#pingSentAt = null;
         const ts = parseFloat(ev.data);
         if (!Number.isNaN(ts)) {
           this.#latency = performance.now() - ts;
@@ -294,10 +316,20 @@ class SSEConn {
 
   #startPing() {
     this.#pingTimer = setInterval(() => {
+      if (this.#stale()) {
+        this.close().catch(() => {});
+        return;
+      }
+      if (this.#pingSentAt === null) this.#pingSentAt = performance.now();
       fetch(`${this.#postURL}&ping=${performance.now()}`, {
         method: "POST",
       }).catch(() => {});
-    }, 5000);
+    }, PING_INTERVAL_MS);
+  }
+
+  #stale() {
+    if (this.#pingSentAt === null) return false;
+    return performance.now() - this.#pingSentAt > PONG_TIMEOUT_MS;
   }
 
   #stopPing() {

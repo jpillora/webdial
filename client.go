@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/jpillora/eventsource"
@@ -29,7 +30,7 @@ func dialWS(ctx context.Context, baseURL string) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newWSConn(ws, -1, flate.BestSpeed), nil
+	return newWSConn(ws, -1, flate.BestSpeed, 30*time.Second), nil
 }
 
 func dialSSE(ctx context.Context, baseURL string) (net.Conn, error) {

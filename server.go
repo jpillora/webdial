@@ -26,10 +26,15 @@ type Server struct {
 	// CompressionLevel is the flate level for per-message WS compression
 	// (1-9, or flate.DefaultCompression). Zero means flate.BestSpeed.
 	CompressionLevel int
-	acceptCh         chan net.Conn
-	sessions         sync.Map // map[string]*sseSession
-	closed           chan struct{}
-	closeOnce        sync.Once
+	// WriteTimeout bounds a single WS frame write, so a peer that stops
+	// reading cannot pin the connection forever. Zero means 30 seconds.
+	// Negative means unbounded. Ignored once the caller sets its own write
+	// deadline via the net.Conn interface.
+	WriteTimeout time.Duration
+	acceptCh     chan net.Conn
+	sessions     sync.Map // map[string]*sseSession
+	closed       chan struct{}
+	closeOnce    sync.Once
 }
 
 func NewServer() *Server {
@@ -91,12 +96,22 @@ func (s *Server) compressionLevel() int {
 	return s.CompressionLevel
 }
 
+func (s *Server) writeTimeout() time.Duration {
+	if s.WriteTimeout == 0 {
+		return 30 * time.Second
+	}
+	if s.WriteTimeout < 0 {
+		return 0
+	}
+	return s.WriteTimeout
+}
+
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
-	conn := newWSConn(ws, s.keepAliveInterval(), s.compressionLevel())
+	conn := newWSConn(ws, s.keepAliveInterval(), s.compressionLevel(), s.writeTimeout())
 	select {
 	case s.acceptCh <- conn:
 	case <-s.closed:

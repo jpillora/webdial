@@ -5,40 +5,60 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
+// pongQueue is deliberately shallow: a peer that has not drained one pong is
+// not going to benefit from us buffering more.
+const pongQueue = 4
+
 type wsConn struct {
-	ws        *websocket.Conn
-	reader    io.Reader
-	mu        sync.Mutex
-	writeMu   sync.Mutex
-	done      chan struct{}
-	closeOnce sync.Once
+	ws           *websocket.Conn
+	reader       io.Reader
+	mu           sync.Mutex
+	writeMu      sync.Mutex
+	writeTimeout time.Duration
+	userDeadline atomic.Bool
+	pongs        chan []byte
+	done         chan struct{}
+	closeOnce    sync.Once
 }
 
-func newWSConn(ws *websocket.Conn, keepAlive time.Duration, compressionLevel int) net.Conn {
+func newWSConn(ws *websocket.Conn, keepAlive time.Duration, compressionLevel int, writeTimeout time.Duration) net.Conn {
 	ws.EnableWriteCompression(true)
 	_ = ws.SetCompressionLevel(compressionLevel)
 	c := &wsConn{
-		ws:   ws,
-		done: make(chan struct{}),
+		ws:           ws,
+		writeTimeout: writeTimeout,
+		pongs:        make(chan []byte, pongQueue),
+		done:         make(chan struct{}),
 	}
-	if keepAlive >= 0 {
-		go c.pingLoop(keepAlive)
-	}
+	go c.controlLoop(keepAlive)
 	return c
 }
 
-func (c *wsConn) pingLoop(interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+// controlLoop owns every write the read path would otherwise have to make.
+// Answering a ping inline would mean taking writeMu while holding the read
+// mutex, so a single slow data write would stall all inbound data behind the
+// peer's own heartbeat.
+func (c *wsConn) controlLoop(keepAlive time.Duration) {
+	var ticks <-chan time.Time
+	if keepAlive > 0 {
+		ticker := time.NewTicker(keepAlive)
+		defer ticker.Stop()
+		ticks = ticker.C
+	}
 	for {
 		select {
-		case <-ticker.C:
+		case <-ticks:
 			if err := c.ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
+				return
+			}
+		case payload := <-c.pongs:
+			if err := c.writeControl(payload); err != nil {
 				return
 			}
 		case <-c.done:
@@ -76,10 +96,7 @@ func (c *wsConn) Read(b []byte) (int, error) {
 }
 
 func (c *wsConn) Write(b []byte) (int, error) {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	err := c.ws.WriteMessage(websocket.BinaryMessage, b)
-	if err != nil {
+	if err := c.writeMessage(websocket.BinaryMessage, b); err != nil {
 		return 0, err
 	}
 	return len(b), nil
@@ -87,16 +104,34 @@ func (c *wsConn) Write(b []byte) (int, error) {
 
 // handleControl responds to application-level text control frames. A "ping:<ts>"
 // frame is echoed back as "pong:<ts>" so the peer can measure round-trip latency.
+// The reply is handed to controlLoop rather than written here — see its comment.
 func (c *wsConn) handleControl(payload []byte) {
-	if ts, ok := bytes.CutPrefix(payload, []byte("ping:")); ok {
-		c.writeControl(append([]byte("pong:"), ts...))
+	ts, ok := bytes.CutPrefix(payload, []byte("ping:"))
+	if !ok {
+		return
+	}
+	select {
+	case c.pongs <- append([]byte("pong:"), ts...):
+	default:
 	}
 }
 
 func (c *wsConn) writeControl(payload []byte) error {
+	return c.writeMessage(websocket.TextMessage, payload)
+}
+
+// writeMessage serialises writes and bounds them. gorilla blocks until the
+// frame is flushed, so without a deadline a peer that stops reading pins both
+// the connection and writeMu forever.
+func (c *wsConn) writeMessage(msgType int, b []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	return c.ws.WriteMessage(websocket.TextMessage, payload)
+	if c.writeTimeout > 0 && !c.userDeadline.Load() {
+		if err := c.ws.SetWriteDeadline(time.Now().Add(c.writeTimeout)); err != nil {
+			return err
+		}
+	}
+	return c.ws.WriteMessage(msgType, b)
 }
 
 func (c *wsConn) Close() error {
@@ -113,7 +148,7 @@ func (c *wsConn) SetDeadline(t time.Time) error {
 	if err := c.ws.SetReadDeadline(t); err != nil {
 		return err
 	}
-	return c.ws.SetWriteDeadline(t)
+	return c.SetWriteDeadline(t)
 }
 
 func (c *wsConn) SetReadDeadline(t time.Time) error {
@@ -121,5 +156,6 @@ func (c *wsConn) SetReadDeadline(t time.Time) error {
 }
 
 func (c *wsConn) SetWriteDeadline(t time.Time) error {
+	c.userDeadline.Store(!t.IsZero())
 	return c.ws.SetWriteDeadline(t)
 }
