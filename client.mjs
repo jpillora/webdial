@@ -138,6 +138,23 @@ class WSConn {
     }
   }
 
+  /**
+   * Ping now and restart the staleness window. A caller that knows wall-clock
+   * passed while nothing here was running — a tab returning to the foreground,
+   * a machine waking — needs both halves: the next scheduled tick would
+   * otherwise judge the socket against a #pingSentAt from before the gap and
+   * close a healthy connection, and waiting for that tick is the only other way
+   * to find out the socket did not survive.
+   */
+  ping() {
+    try {
+      this.#ws.send("ping:" + performance.now());
+    } catch {
+      return;
+    }
+    this.#pingSentAt = performance.now();
+  }
+
   #startPing() {
     this.#pingTimer = setInterval(() => {
       if (this.#stale()) {
@@ -312,6 +329,14 @@ class SSEConn {
     try {
       await this.#decoder.cancel();
     } catch {}
+  }
+
+  /** See WSConn.ping. */
+  ping() {
+    this.#pingSentAt = performance.now();
+    fetch(`${this.#postURL}&ping=${performance.now()}`, {
+      method: "POST",
+    }).catch(() => {});
   }
 
   #startPing() {
