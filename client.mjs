@@ -23,24 +23,27 @@ function base64Decode(str) {
  * Dial connects to a webdial server.
  * Tries WebSocket first, falls back to SSE+POST.
  * @param {string} baseURL
- * @param {{ transport?: 'ws' | 'sse' }} [opts]
+ * @param {{ transport?: 'ws' | 'sse', pingIntervalMs?: number, pongTimeoutMs?: number }} [opts]
+ *   pingIntervalMs paces the keep-alive; pongTimeoutMs is how long an
+ *   unanswered ping stands before the connection is presumed dead (default
+ *   three intervals).
  * @returns {Promise<WebDialConn>}
  */
 export async function dial(baseURL, opts) {
   baseURL = baseURL.replace(/\/+$/, "");
   const transport = opts?.transport;
-  if (transport === "sse") return dialSSE(baseURL);
-  if (transport === "ws") return dialWS(baseURL);
+  if (transport === "sse") return dialSSE(baseURL, opts);
+  if (transport === "ws") return dialWS(baseURL, opts);
   try {
-    return await dialWS(baseURL);
+    return await dialWS(baseURL, opts);
   } catch {
-    return await dialSSE(baseURL);
+    return await dialSSE(baseURL, opts);
   }
 }
 
 // --- WebSocket transport ---
 
-async function dialWS(baseURL) {
+async function dialWS(baseURL, opts) {
   const wsURL = baseURL.replace(/^https:/, "wss:").replace(/^http:/, "ws:");
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(wsURL);
@@ -48,7 +51,7 @@ async function dialWS(baseURL) {
     ws.onopen = () => {
       ws.onopen = null;
       ws.onerror = null;
-      resolve(new WSConn(ws, baseURL));
+      resolve(new WSConn(ws, baseURL, opts));
     };
     ws.onerror = () => {
       ws.onopen = null;
@@ -68,11 +71,16 @@ class WSConn {
   #latency = null;
   #pingTimer = null;
   #pingSentAt = null;
+  #lastRecvAt = 0;
+  #pingInterval = PING_INTERVAL_MS;
+  #pongTimeout = PONG_TIMEOUT_MS;
   onLatency = null;
 
-  constructor(ws, url) {
+  constructor(ws, url, opts) {
     this.#ws = ws;
     this.#url = url;
+    this.#pingInterval = opts?.pingIntervalMs ?? PING_INTERVAL_MS;
+    this.#pongTimeout = opts?.pongTimeoutMs ?? this.#pingInterval * 3;
     ws.onmessage = (event) => {
       if (typeof event.data === "string") {
         this.#handleControl(event.data);
@@ -84,6 +92,7 @@ class WSConn {
       } else {
         this.#queue.push(data);
       }
+      this.#lastRecvAt = performance.now();
     };
     ws.onclose = () => {
       this.#closed = true;
@@ -165,12 +174,25 @@ class WSConn {
         this.#ws.send("ping:" + performance.now());
         if (this.#pingSentAt === null) this.#pingSentAt = performance.now();
       } catch {}
-    }, PING_INTERVAL_MS);
+    }, this.#pingInterval);
   }
 
   #stale() {
     if (this.#pingSentAt === null) return false;
-    return performance.now() - this.#pingSentAt > PONG_TIMEOUT_MS;
+    // Frames the caller has not read yet are the same evidence, and they
+    // survive the case #lastRecvAt cannot cover: while a slow consumer drains
+    // the queue in one uninterrupted run of microtasks, neither onmessage nor
+    // this timer gets to run, and which of them the event loop reaches first
+    // afterwards is not ours to decide.
+    if (this.#queue.length > 0) return false;
+    // Data arriving after the ping went out proves the peer is there, so the
+    // missing pong is queued rather than lost. That is the normal state of a
+    // connection whose peer is sending faster than this end can consume: the
+    // pong sits behind the backlog, and every frame still to come is evidence
+    // against the conclusion that nobody is home. Closing here would tear down
+    // a working connection precisely when it is busiest.
+    if (this.#lastRecvAt > this.#pingSentAt) return false;
+    return performance.now() - this.#pingSentAt > this.#pongTimeout;
   }
 
   #stopPing() {
@@ -193,7 +215,7 @@ class WSConn {
 
 // --- SSE + POST transport ---
 
-async function dialSSE(baseURL) {
+async function dialSSE(baseURL, opts) {
   const resp = await fetch(baseURL, {
     headers: { Accept: "text/event-stream" },
   });
@@ -203,7 +225,7 @@ async function dialSSE(baseURL) {
   if (!first || first.event !== "sid") {
     throw new Error(`webdial: expected sid event, got ${first?.event}`);
   }
-  return new SSEConn(baseURL, first.data, decoder);
+  return new SSEConn(baseURL, first.data, decoder, opts);
 }
 
 class SSEDecoder {
@@ -263,9 +285,14 @@ class SSEConn {
   #latency = null;
   #pingTimer = null;
   #pingSentAt = null;
+  #lastRecvAt = 0;
+  #pingInterval = PING_INTERVAL_MS;
+  #pongTimeout = PONG_TIMEOUT_MS;
   onLatency = null;
 
-  constructor(baseURL, sid, decoder) {
+  constructor(baseURL, sid, decoder, opts) {
+    this.#pingInterval = opts?.pingIntervalMs ?? PING_INTERVAL_MS;
+    this.#pongTimeout = opts?.pongTimeoutMs ?? this.#pingInterval * 3;
     this.#baseURL = baseURL;
     this.#sid = sid;
     this.#decoder = decoder;
@@ -285,7 +312,10 @@ class SSEConn {
         this.#stopPing();
         return null;
       }
-      if (ev.event === "d") return base64Decode(ev.data);
+      if (ev.event === "d") {
+        this.#lastRecvAt = performance.now();
+        return base64Decode(ev.data);
+      }
       if (ev.event === "pong") {
         this.#pingSentAt = null;
         const ts = parseFloat(ev.data);
@@ -349,12 +379,19 @@ class SSEConn {
       fetch(`${this.#postURL}&ping=${performance.now()}`, {
         method: "POST",
       }).catch(() => {});
-    }, PING_INTERVAL_MS);
+    }, this.#pingInterval);
   }
 
   #stale() {
     if (this.#pingSentAt === null) return false;
-    return performance.now() - this.#pingSentAt > PONG_TIMEOUT_MS;
+    // Data arriving after the ping went out proves the peer is there, so the
+    // missing pong is queued rather than lost. That is the normal state of a
+    // connection whose peer is sending faster than this end can consume: the
+    // pong sits behind the backlog, and every frame still to come is evidence
+    // against the conclusion that nobody is home. Closing here would tear down
+    // a working connection precisely when it is busiest.
+    if (this.#lastRecvAt > this.#pingSentAt) return false;
+    return performance.now() - this.#pingSentAt > this.#pongTimeout;
   }
 
   #stopPing() {
