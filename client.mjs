@@ -30,7 +30,6 @@ function base64Decode(str) {
  * @returns {Promise<WebDialConn>}
  */
 export async function dial(baseURL, opts) {
-  baseURL = baseURL.replace(/\/+$/, "");
   const transport = opts?.transport;
   if (transport === "sse") return dialSSE(baseURL, opts);
   if (transport === "ws") return dialWS(baseURL, opts);
@@ -44,7 +43,7 @@ export async function dial(baseURL, opts) {
 // --- WebSocket transport ---
 
 async function dialWS(baseURL, opts) {
-  const wsURL = baseURL.replace(/^https:/, "wss:").replace(/^http:/, "ws:");
+  const wsURL = websocketURL(baseURL);
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(wsURL);
     ws.binaryType = "arraybuffer";
@@ -59,6 +58,29 @@ async function dialWS(baseURL, opts) {
       reject(new Error("webdial: websocket connection failed"));
     };
   });
+}
+
+function websocketURL(baseURL) {
+  const url = parseURL(baseURL);
+  if (url.protocol === "http:") url.protocol = "ws:";
+  else if (url.protocol === "https:") url.protocol = "wss:";
+  return url.href;
+}
+
+// Encode only the new parameter. Mutating URL.searchParams directly would
+// reserialize the caller's entire query (for example, changing %20 to +).
+function appendURLQueryParam(baseURL, name, value) {
+  const url = parseURL(baseURL);
+  const encoded = new URLSearchParams([[name, value]]).toString();
+  url.search = url.search ? `${url.search}&${encoded}` : encoded;
+  return url.href;
+}
+
+function parseURL(baseURL) {
+  // Browsers historically accepted relative endpoints because fetch and
+  // WebSocket resolve them against the page. Keep that behavior while Node,
+  // which has no document base URL, continues to require an absolute URL.
+  return new URL(baseURL, globalThis.location?.href);
 }
 
 class WSConn {
@@ -297,8 +319,7 @@ class SSEConn {
     this.#sid = sid;
     this.#decoder = decoder;
     this.#url = baseURL;
-    const sep = baseURL.includes("?") ? "&" : "?";
-    this.#postURL = `${baseURL}${sep}s=${sid}`;
+    this.#postURL = appendURLQueryParam(baseURL, "s", sid);
     this.#startPing();
   }
 
@@ -352,7 +373,7 @@ class SSEConn {
     this.#closed = true;
     this.#stopPing();
     try {
-      await fetch(`${this.#postURL}&close=1`, {
+      await fetch(appendURLQueryParam(this.#postURL, "close", "1"), {
         method: "POST",
       });
     } catch {}
@@ -364,7 +385,7 @@ class SSEConn {
   /** See WSConn.ping. */
   ping() {
     this.#pingSentAt = performance.now();
-    fetch(`${this.#postURL}&ping=${performance.now()}`, {
+    fetch(appendURLQueryParam(this.#postURL, "ping", performance.now()), {
       method: "POST",
     }).catch(() => {});
   }
@@ -376,7 +397,7 @@ class SSEConn {
         return;
       }
       if (this.#pingSentAt === null) this.#pingSentAt = performance.now();
-      fetch(`${this.#postURL}&ping=${performance.now()}`, {
+      fetch(appendURLQueryParam(this.#postURL, "ping", performance.now()), {
         method: "POST",
       }).catch(() => {});
     }, this.#pingInterval);
