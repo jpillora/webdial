@@ -55,7 +55,7 @@ connectBtn.onclick = async () => {
   connectBtn.disabled = true;
   statusEl.textContent = "connecting...";
   try {
-    conn = await dial(location.origin + "/wd", opts);
+    conn = await dial(location.origin + "/wd/", opts);
     statusEl.textContent = `connected (${conn.transport})`;
     appendLog("info", `connected via ${conn.transport}`);
     msgInput.disabled = false;

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -14,7 +15,6 @@ import (
 )
 
 func Dial(ctx context.Context, baseURL string) (net.Conn, error) {
-	baseURL = strings.TrimRight(baseURL, "/")
 	conn, err := dialWS(ctx, baseURL)
 	if err == nil {
 		return conn, nil
@@ -23,8 +23,10 @@ func Dial(ctx context.Context, baseURL string) (net.Conn, error) {
 }
 
 func dialWS(ctx context.Context, baseURL string) (net.Conn, error) {
-	wsURL := strings.Replace(baseURL, "https://", "wss://", 1)
-	wsURL = strings.Replace(wsURL, "http://", "ws://", 1)
+	wsURL, err := websocketURL(baseURL)
+	if err != nil {
+		return nil, err
+	}
 	dialer := websocket.Dialer{}
 	ws, _, err := dialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
@@ -60,5 +62,42 @@ func dialSSE(ctx context.Context, baseURL string) (net.Conn, error) {
 		return nil, fmt.Errorf("webdial: expected sid event, got %q", ev.Type)
 	}
 	sid := string(ev.Data)
-	return newSSEClientConn(baseURL, sid, resp, decoder, client), nil
+	conn, err := newSSEClientConn(baseURL, sid, resp, decoder, client)
+	if err != nil {
+		resp.Body.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+// websocketURL changes only the URL scheme. In particular, URL-like text in
+// the query or fragment is left untouched.
+func websocketURL(baseURL string) (string, error) {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return "", fmt.Errorf("webdial: parse endpoint URL: %w", err)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		u.Scheme = "ws"
+	case "https":
+		u.Scheme = "wss"
+	}
+	return u.String(), nil
+}
+
+// appendURLQueryParam inserts an encoded parameter before any fragment while
+// retaining the caller's existing raw query exactly as supplied.
+func appendURLQueryParam(baseURL, name, value string) (string, error) {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return "", fmt.Errorf("webdial: parse endpoint URL: %w", err)
+	}
+	encoded := url.Values{name: []string{value}}.Encode()
+	if u.RawQuery == "" {
+		u.RawQuery = encoded
+	} else {
+		u.RawQuery += "&" + encoded
+	}
+	return u.String(), nil
 }

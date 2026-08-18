@@ -6,6 +6,10 @@
 
 Both sides get a standard `net.Conn` (Go) or an equivalent read/write/close interface (JavaScript), so any stream-oriented protocol works over it.
 
+Endpoint paths are used exactly as supplied. Include the trailing slash when
+the handler is mounted on a subtree such as `/wd/`; existing query parameters
+are preserved.
+
 ## Go
 
 ### Install
@@ -67,7 +71,7 @@ WebSocket handshakes.
 ### Client
 
 ```go
-conn, err := webdial.Dial(ctx, "http://localhost:8080/wd")
+conn, err := webdial.Dial(ctx, "http://localhost:8080/wd/")
 if err != nil {
     log.Fatal(err)
 }
@@ -105,7 +109,7 @@ import { dial } from "/path/to/client.mjs";
 ```js
 import { dial } from "webdial";
 
-const conn = await dial("http://localhost:8080/wd");
+const conn = await dial("http://localhost:8080/wd/");
 
 // Send text
 await conn.write("hello");

@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -20,6 +19,7 @@ type sseClientConn struct {
 	baseURL    string
 	sessionID  string
 	postURL    string
+	closeURL   string
 	sseResp    *http.Response
 	decoder    *eventsource.Decoder
 	readBuf    bytes.Buffer
@@ -30,21 +30,26 @@ type sseClientConn struct {
 	remoteAddr addr
 }
 
-func newSSEClientConn(baseURL, sessionID string, sseResp *http.Response, decoder *eventsource.Decoder, client *http.Client) *sseClientConn {
-	sep := "?"
-	if strings.Contains(baseURL, "?") {
-		sep = "&"
+func newSSEClientConn(baseURL, sessionID string, sseResp *http.Response, decoder *eventsource.Decoder, client *http.Client) (*sseClientConn, error) {
+	postURL, err := appendURLQueryParam(baseURL, "s", sessionID)
+	if err != nil {
+		return nil, err
+	}
+	closeURL, err := appendURLQueryParam(postURL, "close", "1")
+	if err != nil {
+		return nil, err
 	}
 	return &sseClientConn{
 		baseURL:    baseURL,
 		sessionID:  sessionID,
-		postURL:    baseURL + sep + "s=" + sessionID,
+		postURL:    postURL,
+		closeURL:   closeURL,
 		sseResp:    sseResp,
 		decoder:    decoder,
 		client:     client,
 		localAddr:  addr{transport: "sse", url: "local"},
 		remoteAddr: addr{transport: "sse", url: baseURL},
-	}
+	}, nil
 }
 
 func (c *sseClientConn) Read(b []byte) (int, error) {
@@ -102,8 +107,7 @@ func (c *sseClientConn) Close() error {
 	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	url := c.postURL + "&close=1"
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, url, nil)
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, c.closeURL, nil)
 	resp, err := c.client.Do(req)
 	if err == nil {
 		resp.Body.Close()

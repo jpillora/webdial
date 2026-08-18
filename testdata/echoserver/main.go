@@ -15,8 +15,10 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println("http://" + ln.Addr().String())
-	go http.Serve(ln, srv)
+	fmt.Println("http://" + ln.Addr().String() + "/wd/")
+	mux := http.NewServeMux()
+	mux.Handle("/wd/", srv)
+	go http.Serve(ln, mux)
 	for {
 		conn, err := srv.Accept()
 		if err != nil {
