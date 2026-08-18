@@ -264,7 +264,7 @@ func (s *Server) handlePostData(w http.ResponseWriter, r *http.Request, sess *ss
 		// A streamed unlimited POST may already have delivered a prefix. In that
 		// case terminate the session so a retry cannot silently duplicate bytes.
 		if delivered {
-			sess.conn.shutdown()
+			sess.conn.shutdown(net.ErrClosed)
 		}
 		writePostDeliveryError(w, r, err)
 		return
