@@ -44,6 +44,19 @@ for {
 
 `srv.Accept()` returns a `net.Conn`. Use it with any protocol that works over a byte stream.
 
+SSE data POSTs are limited to 1 MiB each by default. Configure a different
+limit when constructing the server (a negative value explicitly disables it):
+
+```go
+srv.MaxPostBytes = 4 << 20 // 4 MiB
+```
+
+Oversized bodies receive HTTP 413, which both clients return as a write error.
+Successful POST bodies for one SSE connection are delivered contiguously and
+one at a time. When clients issue concurrent writes, the body that acquires the
+server first is delivered first; callers that require a specific order should
+await each write's successful response before starting the next.
+
 #### WebSocket origin policy
 
 WebSocket handshakes use a secure same-origin policy by default. Browser requests

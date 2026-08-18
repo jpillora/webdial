@@ -204,5 +204,35 @@ func (c *sseServerConn) LocalAddr() net.Addr  { return c.localAddr }
 func (c *sseServerConn) RemoteAddr() net.Addr { return c.remoteAddr }
 
 type sseSession struct {
-	conn *sseServerConn
+	conn     *sseServerConn
+	postLock chan struct{}
+}
+
+func newSSESession(conn *sseServerConn) *sseSession {
+	return &sseSession{
+		conn:     conn,
+		postLock: make(chan struct{}, 1),
+	}
+}
+
+func (s *sseSession) acquirePost(ctx context.Context) error {
+	if s.conn.closed.Load() {
+		return io.ErrClosedPipe
+	}
+	select {
+	case s.postLock <- struct{}{}:
+		if s.conn.closed.Load() {
+			s.releasePost()
+			return io.ErrClosedPipe
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.conn.closeCh:
+		return io.ErrClosedPipe
+	}
+}
+
+func (s *sseSession) releasePost() {
+	<-s.postLock
 }

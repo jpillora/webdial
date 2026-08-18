@@ -80,6 +80,17 @@ try {
     console.log("  pass");
   }
 
+  {
+    console.log("test sse oversized write error...");
+    const conn = await dial(url, { transport: "sse" });
+    await assert.rejects(
+      conn.write(new Uint8Array((1 << 20) + 1)),
+      /webdial: post returned 413/,
+    );
+    await conn.close();
+    console.log("  pass");
+  }
+
   // --- Auto-detection (should prefer ws) ---
   {
     console.log("test auto-detect...");
