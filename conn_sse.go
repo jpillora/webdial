@@ -25,12 +25,13 @@ type sseClientConn struct {
 	readBuf    bytes.Buffer
 	writeMu    sync.Mutex
 	client     *http.Client
+	cancel     context.CancelFunc
 	closed     atomic.Bool
 	localAddr  addr
 	remoteAddr addr
 }
 
-func newSSEClientConn(baseURL, sessionID string, sseResp *http.Response, decoder *eventsource.Decoder, client *http.Client) (*sseClientConn, error) {
+func newSSEClientConn(baseURL, sessionID string, sseResp *http.Response, decoder *eventsource.Decoder, client *http.Client, cancel context.CancelFunc) (*sseClientConn, error) {
 	postURL, err := appendURLQueryParam(baseURL, "s", sessionID)
 	if err != nil {
 		return nil, err
@@ -47,6 +48,7 @@ func newSSEClientConn(baseURL, sessionID string, sseResp *http.Response, decoder
 		sseResp:    sseResp,
 		decoder:    decoder,
 		client:     client,
+		cancel:     cancel,
 		localAddr:  addr{transport: "sse", url: "local"},
 		remoteAddr: addr{transport: "sse", url: baseURL},
 	}, nil
@@ -62,6 +64,7 @@ func (c *sseClientConn) Read(b []byte) (int, error) {
 		}
 		var ev eventsource.Event
 		if err := c.decoder.Decode(&ev); err != nil {
+			c.cancel()
 			return 0, err
 		}
 		switch ev.Type {
@@ -73,6 +76,7 @@ func (c *sseClientConn) Read(b []byte) (int, error) {
 			c.readBuf.Write(decoded)
 		case "close":
 			c.closed.Store(true)
+			c.cancel()
 			return 0, io.EOF
 		}
 	}
@@ -105,6 +109,10 @@ func (c *sseClientConn) Close() error {
 	if c.closed.Swap(true) {
 		return nil
 	}
+	// Release a blocked stream read immediately. The dial context no longer owns
+	// this request after establishment; Close is its lifetime boundary.
+	c.cancel()
+	c.sseResp.Body.Close()
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, c.closeURL, nil)
@@ -112,7 +120,6 @@ func (c *sseClientConn) Close() error {
 	if err == nil {
 		resp.Body.Close()
 	}
-	c.sseResp.Body.Close()
 	return nil
 }
 
@@ -148,6 +155,15 @@ func (c *sseServerConn) writeEvent(ev eventsource.Event) error {
 		return io.ErrClosedPipe
 	}
 	return eventsource.WriteEvent(c.w, ev)
+}
+
+// finishResponse prevents any application or control write from outliving the
+// HTTP handler that owns the ResponseWriter. Marking the connection first
+// rejects future writes; taking writeMu waits for a write already in flight.
+func (c *sseServerConn) finishResponse() {
+	c.closed.Store(true)
+	c.writeMu.Lock()
+	c.writeMu.Unlock()
 }
 
 // Write encodes b and writes it as an SSE event.

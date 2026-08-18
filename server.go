@@ -141,6 +141,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 	s.sessions.Store(sid, &sseSession{conn: conn})
 	defer func() {
+		conn.finishResponse()
 		s.sessions.Delete(sid)
 		pw.Close()
 	}()
