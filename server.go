@@ -1,7 +1,9 @@
 package webdial
 
 import (
+	"bytes"
 	"compress/flate"
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -14,6 +16,8 @@ import (
 	"github.com/jpillora/eventsource"
 )
 
+const defaultMaxPostBytes int64 = 1 << 20 // 1 MiB
+
 type Server struct {
 	// KeepAlive is the interval between keep-alive pings.
 	// Zero means 25 seconds. Negative means disabled.
@@ -24,6 +28,9 @@ type Server struct {
 	// must have an Origin host matching the request Host. CheckOrigin may be
 	// called concurrently and must be safe for concurrent use.
 	CheckOrigin func(*http.Request) bool
+	// MaxPostBytes limits the body of each SSE data POST. Zero means 1 MiB.
+	// Negative disables the limit. Oversized requests receive HTTP 413.
+	MaxPostBytes int64
 	// CompressionLevel is the flate level for per-message WS compression
 	// (1-9, or flate.DefaultCompression). Zero means flate.BestSpeed.
 	CompressionLevel int
@@ -139,7 +146,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		localAddr:  addr{transport: "sse", url: "server"},
 		remoteAddr: addr{transport: "sse", url: r.RemoteAddr},
 	}
-	s.sessions.Store(sid, &sseSession{conn: conn})
+	s.sessions.Store(sid, newSSESession(conn))
 	defer func() {
 		conn.finishResponse()
 		s.sessions.Delete(sid)
@@ -205,15 +212,95 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if ping := r.URL.Query().Get("ping"); ping != "" {
-		sess.conn.writePong([]byte(ping))
+		if err := sess.conn.writePong([]byte(ping)); err != nil {
+			http.Error(w, "session closed", http.StatusGone)
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "read error", http.StatusInternalServerError)
+	s.handlePostData(w, r, sess)
+}
+
+func (s *Server) maxPostBytes() int64 {
+	if s.MaxPostBytes == 0 {
+		return defaultMaxPostBytes
+	}
+	return s.MaxPostBytes
+}
+
+func (s *Server) handlePostData(w http.ResponseWriter, r *http.Request, sess *sseSession) {
+	limit := s.maxPostBytes()
+	if limit >= 0 && r.ContentLength > limit {
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
-	sess.conn.writePipe.Write(body)
+
+	if err := sess.acquirePost(r.Context()); err != nil {
+		writePostDeliveryError(w, r, err)
+		return
+	}
+	defer sess.releasePost()
+
+	var body io.Reader = r.Body
+	if limit >= 0 {
+		body = http.MaxBytesReader(w, r.Body, limit)
+		// A chunked body has no trustworthy size up front. Buffering at most the
+		// configured limit lets us reject it without delivering a partial POST.
+		if r.ContentLength < 0 {
+			buffered, err := io.ReadAll(body)
+			if err != nil {
+				writePostReadError(w, err)
+				return
+			}
+			body = bytes.NewReader(buffered)
+		}
+	}
+
+	// An io.Pipe write waits for the application to read. If the HTTP client
+	// disappears while that write is blocked, fail the inbound stream to wake
+	// both sides instead of leaking this handler goroutine.
+	cancelFinished := make(chan struct{})
+	stopCancel := context.AfterFunc(r.Context(), func() {
+		defer close(cancelFinished)
+		sess.conn.writePipe.CloseWithError(r.Context().Err())
+	})
+	_, err := io.Copy(sess.conn.writePipe, body)
+	if !stopCancel() {
+		<-cancelFinished
+	}
+	if err == nil {
+		err = r.Context().Err()
+	}
+	if err != nil {
+		// A streamed POST may already have delivered a prefix. Terminate the
+		// inbound byte stream so a retry cannot silently duplicate that prefix.
+		sess.conn.writePipe.CloseWithError(err)
+		writePostDeliveryError(w, r, err)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func writePostReadError(w http.ResponseWriter, err error) {
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	http.Error(w, "read error", http.StatusBadRequest)
+}
+
+func writePostDeliveryError(w http.ResponseWriter, r *http.Request, err error) {
+	var maxBytesErr *http.MaxBytesError
+	switch {
+	case errors.As(err, &maxBytesErr):
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+	case r.Context().Err() != nil:
+		http.Error(w, "request canceled", http.StatusRequestTimeout)
+	case errors.Is(err, io.ErrClosedPipe):
+		http.Error(w, "session closed", http.StatusGone)
+	default:
+		http.Error(w, "delivery error", http.StatusInternalServerError)
+	}
 }
