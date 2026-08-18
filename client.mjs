@@ -8,6 +8,9 @@ const PING_INTERVAL_MS = 5000;
 // in background tabs, but message delivery is not, so a live peer still clears
 // this well before the deadline.
 const PONG_TIMEOUT_MS = 3 * PING_INTERVAL_MS;
+const SSE_MAX_BUFFERED_BYTES = 1024 * 1024;
+// A byte limit alone does not bound the bookkeeping for empty data events.
+const SSE_MAX_BUFFERED_EVENTS = 1024;
 
 /** Decode a base64 string (handles unpadded) to Uint8Array. */
 function base64Decode(str) {
@@ -23,10 +26,11 @@ function base64Decode(str) {
  * Dial connects to a webdial server.
  * Tries WebSocket first, falls back to SSE+POST.
  * @param {string} baseURL
- * @param {{ transport?: 'ws' | 'sse', pingIntervalMs?: number, pongTimeoutMs?: number }} [opts]
+ * @param {{ transport?: 'ws' | 'sse', pingIntervalMs?: number, pongTimeoutMs?: number, maxBufferedBytes?: number }} [opts]
  *   pingIntervalMs paces the keep-alive; pongTimeoutMs is how long an
  *   unanswered ping stands before the connection is presumed dead (default
- *   three intervals).
+ *   three intervals). maxBufferedBytes limits decoded SSE data waiting for a
+ *   reader (default 1 MiB); SSE also caps the backlog at 1024 data events.
  * @returns {Promise<WebDialConn>}
  */
 export async function dial(baseURL, opts) {
@@ -232,6 +236,13 @@ class WSConn {
 // --- SSE + POST transport ---
 
 async function dialSSE(baseURL, opts) {
+  const maxBufferedBytes =
+    opts?.maxBufferedBytes ?? SSE_MAX_BUFFERED_BYTES;
+  if (!Number.isSafeInteger(maxBufferedBytes) || maxBufferedBytes < 0) {
+    throw new TypeError(
+      "webdial: maxBufferedBytes must be a non-negative safe integer",
+    );
+  }
   const resp = await fetch(baseURL, {
     headers: { Accept: "text/event-stream" },
   });
@@ -241,7 +252,7 @@ async function dialSSE(baseURL, opts) {
   if (!first || first.event !== "sid") {
     throw new Error(`webdial: expected sid event, got ${first?.event}`);
   }
-  return new SSEConn(baseURL, first.data, decoder, opts);
+  return new SSEConn(baseURL, first.data, decoder, opts, maxBufferedBytes);
 }
 
 class SSEDecoder {
@@ -295,7 +306,11 @@ class SSEConn {
   #baseURL;
   #sid;
   #decoder;
+  #queue = [];
+  #queuedBytes = 0;
+  #waiters = [];
   #closed = false;
+  #closeErr = null;
   #url;
   #postURL;
   #latency = null;
@@ -303,51 +318,39 @@ class SSEConn {
   #pingSentAt = null;
   #pingInterval = PING_INTERVAL_MS;
   #pongTimeout = PONG_TIMEOUT_MS;
+  #maxBufferedBytes = SSE_MAX_BUFFERED_BYTES;
   onLatency = null;
 
-  constructor(baseURL, sid, decoder, opts) {
+  constructor(baseURL, sid, decoder, opts, maxBufferedBytes) {
     this.#pingInterval = opts?.pingIntervalMs ?? PING_INTERVAL_MS;
     this.#pongTimeout = opts?.pongTimeoutMs ?? this.#pingInterval * 3;
     this.#baseURL = baseURL;
     this.#sid = sid;
     this.#decoder = decoder;
+    this.#maxBufferedBytes = maxBufferedBytes;
     this.#url = baseURL;
     this.#postURL = appendURLQueryParam(baseURL, "s", sid);
     this.#startPing();
+    // Exactly one task owns the decoder. Public reads consume its deliveries,
+    // never the event stream itself, so control traffic remains live even when
+    // the application is idle or has multiple reads pending.
+    void this.#pump();
   }
 
   /** @returns {Promise<Uint8Array|null>} null on EOF/close */
   async read() {
-    if (this.#closed) return null;
-    while (true) {
-      const ev = await this.#decoder.next();
-      if (!ev) {
-        this.#closed = true;
-        this.#stopPing();
-        return null;
-      }
-      if (ev.event === "d") {
-        // Data satisfies the outstanding liveness probe. The next timer tick
-        // must create a new probe so a finite burst cannot keep a dead peer
-        // alive forever.
-        this.#pingSentAt = null;
-        return base64Decode(ev.data);
-      }
-      if (ev.event === "pong") {
-        this.#pingSentAt = null;
-        const ts = parseFloat(ev.data);
-        if (!Number.isNaN(ts)) {
-          this.#latency = performance.now() - ts;
-          this.onLatency?.(this.#latency);
-        }
-        continue;
-      }
-      if (ev.event === "close") {
-        this.#closed = true;
-        this.#stopPing();
-        return null;
-      }
+    if (this.#queue.length > 0) {
+      const data = this.#queue.shift();
+      this.#queuedBytes -= data.byteLength;
+      return data;
     }
+    if (this.#closed) {
+      if (this.#closeErr) throw this.#closeErr;
+      return null;
+    }
+    return new Promise((resolve, reject) => {
+      this.#waiters.push({ resolve, reject });
+    });
   }
 
   /** @param {Uint8Array|string} data */
@@ -366,16 +369,16 @@ class SSEConn {
 
   async close() {
     if (this.#closed) return;
-    this.#closed = true;
-    this.#stopPing();
+    this.#finish(null, true);
+    // Cancel the decoder before starting the best-effort close POST. A slow or
+    // lost POST must not leave the pump or application reads blocked.
+    const cancel = this.#decoder.cancel().catch(() => {});
     try {
       await fetch(appendURLQueryParam(this.#postURL, "close", "1"), {
         method: "POST",
       });
     } catch {}
-    try {
-      await this.#decoder.cancel();
-    } catch {}
+    await cancel;
   }
 
   /** See WSConn.ping. */
@@ -402,6 +405,86 @@ class SSEConn {
   #stale() {
     if (this.#pingSentAt === null) return false;
     return performance.now() - this.#pingSentAt > this.#pongTimeout;
+  }
+
+  async #pump() {
+    try {
+      while (!this.#closed) {
+        const ev = await this.#decoder.next();
+        if (this.#closed) return;
+        if (!ev) {
+          this.#finish(null, false);
+          return;
+        }
+        if (ev.event === "d") {
+          // Data satisfies the outstanding liveness probe. The next timer tick
+          // starts a fresh window, so finite activity cannot permanently mask
+          // a dead peer.
+          this.#pingSentAt = null;
+          const data = base64Decode(ev.data);
+          if (this.#waiters.length > 0) {
+            this.#waiters.shift().resolve(data);
+            continue;
+          }
+          if (
+            this.#queue.length >= SSE_MAX_BUFFERED_EVENTS ||
+            this.#queuedBytes + data.byteLength > this.#maxBufferedBytes
+          ) {
+            const err = new Error(
+              `webdial: SSE receive buffer exceeded (${this.#maxBufferedBytes} bytes or ${SSE_MAX_BUFFERED_EVENTS} events)`,
+            );
+            this.#finish(err, true);
+            await this.#decoder.cancel().catch(() => {});
+            return;
+          }
+          this.#queue.push(data);
+          this.#queuedBytes += data.byteLength;
+          continue;
+        }
+        if (ev.event === "pong") {
+          this.#pingSentAt = null;
+          const ts = parseFloat(ev.data);
+          if (!Number.isNaN(ts)) {
+            this.#latency = performance.now() - ts;
+            this.onLatency?.(this.#latency);
+          }
+          continue;
+        }
+        if (ev.event === "ping") {
+          // Server heartbeats are also direct evidence that the peer is live.
+          this.#pingSentAt = null;
+          continue;
+        }
+        if (ev.event === "close") {
+          this.#finish(null, false);
+          await this.#decoder.cancel().catch(() => {});
+          return;
+        }
+      }
+    } catch (err) {
+      if (!this.#closed) {
+        const closeErr =
+          err instanceof Error ? err : new Error(`webdial: SSE read: ${err}`);
+        this.#finish(closeErr, false);
+        await this.#decoder.cancel().catch(() => {});
+      }
+    }
+  }
+
+  #finish(err, discardQueue) {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#closeErr = err;
+    this.#stopPing();
+    if (discardQueue) {
+      this.#queue = [];
+      this.#queuedBytes = 0;
+    }
+    for (const waiter of this.#waiters) {
+      if (err) waiter.reject(err);
+      else waiter.resolve(null);
+    }
+    this.#waiters = [];
   }
 
   #stopPing() {

@@ -138,6 +138,22 @@ const conn = await dial(url, { transport: "sse" }); // SSE+POST only
 
 By default, `dial` tries WebSocket first and falls back to SSE+POST.
 
+The SSE transport decodes control events in the background, so keep-alives and
+remote closes are handled even when the application is not calling `read()`.
+Decoded data waiting for a reader is bounded to 1 MiB and 1,024 events by
+default. Use `maxBufferedBytes` to change the byte limit:
+
+```js
+const conn = await dial(url, {
+  transport: "sse",
+  maxBufferedBytes: 256 * 1024,
+});
+```
+
+If either receive-buffer limit would be exceeded, the connection closes rather
+than silently dropping data. Its pending and subsequent reads reject with an
+SSE receive-buffer error, and subsequent writes report a closed connection.
+
 ### Connection properties
 
 - `conn.transport` — `"ws"` or `"sse"`
