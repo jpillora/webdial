@@ -132,16 +132,25 @@ func (c *sseServerConn) Read(b []byte) (int, error) {
 	return c.readPipe.Read(b)
 }
 
+// writeEvent serializes all access to the SSE response. The session is made
+// available to POST handlers before the sid event is flushed, so even the
+// initial event must use the same lock as data and control events.
+func (c *sseServerConn) writeEvent(ev eventsource.Event) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	// Close marks the connection closed before emitting its final event. No
+	// other event may be written after that point.
+	if c.closed.Load() && ev.Type != "close" {
+		return io.ErrClosedPipe
+	}
+	return eventsource.WriteEvent(c.w, ev)
+}
+
 // Write encodes b and writes it as an SSE event.
 // Note: eventsource.WriteEvent also flushes the http.ResponseWriter.
 func (c *sseServerConn) Write(b []byte) (int, error) {
-	if c.closed.Load() {
-		return 0, io.ErrClosedPipe
-	}
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
 	encoded := base64.RawStdEncoding.EncodeToString(b)
-	err := eventsource.WriteEvent(c.w, eventsource.Event{
+	err := c.writeEvent(eventsource.Event{
 		Type: "d",
 		Data: []byte(encoded),
 	})
@@ -152,32 +161,20 @@ func (c *sseServerConn) Write(b []byte) (int, error) {
 }
 
 func (c *sseServerConn) writeHeartbeat() error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	if c.closed.Load() {
-		return io.ErrClosedPipe
-	}
-	return eventsource.WriteEvent(c.w, eventsource.Event{Type: "ping"})
+	return c.writeEvent(eventsource.Event{Type: "ping"})
 }
 
 // writePong echoes a client-supplied timestamp back over the SSE stream so the
 // client can measure round-trip latency.
 func (c *sseServerConn) writePong(ts []byte) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	if c.closed.Load() {
-		return io.ErrClosedPipe
-	}
-	return eventsource.WriteEvent(c.w, eventsource.Event{Type: "pong", Data: ts})
+	return c.writeEvent(eventsource.Event{Type: "pong", Data: ts})
 }
 
 func (c *sseServerConn) Close() error {
 	if c.closed.Swap(true) {
 		return nil
 	}
-	c.writeMu.Lock()
-	eventsource.WriteEvent(c.w, eventsource.Event{Type: "close"})
-	c.writeMu.Unlock()
+	c.writeEvent(eventsource.Event{Type: "close"})
 	c.readPipe.Close()
 	close(c.closeCh)
 	return nil
