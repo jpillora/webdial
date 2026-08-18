@@ -58,6 +58,8 @@ fmt.Println(string(buf[:n])) // "hello"
 
 `Dial` tries WebSocket first and falls back to SSE+POST automatically. The returned `net.Conn` works the same regardless of transport.
 
+As with `net.Dialer.DialContext`, `ctx` controls connection establishment only. Canceling it after `Dial` returns does not close the established connection; call `conn.Close()` to end the connection.
+
 ## JavaScript
 
 The ESM client (`client.mjs`) works in both browsers and Node.js 22+. Zero dependencies.

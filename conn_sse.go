@@ -25,12 +25,13 @@ type sseClientConn struct {
 	readBuf    bytes.Buffer
 	writeMu    sync.Mutex
 	client     *http.Client
+	cancel     context.CancelFunc
 	closed     atomic.Bool
 	localAddr  addr
 	remoteAddr addr
 }
 
-func newSSEClientConn(baseURL, sessionID string, sseResp *http.Response, decoder *eventsource.Decoder, client *http.Client) *sseClientConn {
+func newSSEClientConn(baseURL, sessionID string, sseResp *http.Response, decoder *eventsource.Decoder, client *http.Client, cancel context.CancelFunc) *sseClientConn {
 	sep := "?"
 	if strings.Contains(baseURL, "?") {
 		sep = "&"
@@ -42,6 +43,7 @@ func newSSEClientConn(baseURL, sessionID string, sseResp *http.Response, decoder
 		sseResp:    sseResp,
 		decoder:    decoder,
 		client:     client,
+		cancel:     cancel,
 		localAddr:  addr{transport: "sse", url: "local"},
 		remoteAddr: addr{transport: "sse", url: baseURL},
 	}
@@ -57,6 +59,7 @@ func (c *sseClientConn) Read(b []byte) (int, error) {
 		}
 		var ev eventsource.Event
 		if err := c.decoder.Decode(&ev); err != nil {
+			c.cancel()
 			return 0, err
 		}
 		switch ev.Type {
@@ -68,6 +71,7 @@ func (c *sseClientConn) Read(b []byte) (int, error) {
 			c.readBuf.Write(decoded)
 		case "close":
 			c.closed.Store(true)
+			c.cancel()
 			return 0, io.EOF
 		}
 	}
@@ -100,6 +104,10 @@ func (c *sseClientConn) Close() error {
 	if c.closed.Swap(true) {
 		return nil
 	}
+	// Release a blocked stream read immediately. The dial context no longer owns
+	// this request after establishment; Close is its lifetime boundary.
+	c.cancel()
+	c.sseResp.Body.Close()
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	url := c.postURL + "&close=1"
@@ -108,7 +116,6 @@ func (c *sseClientConn) Close() error {
 	if err == nil {
 		resp.Body.Close()
 	}
-	c.sseResp.Body.Close()
 	return nil
 }
 
