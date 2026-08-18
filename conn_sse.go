@@ -199,10 +199,15 @@ func (c *sseClientConn) Write(b []byte) (int, error) {
 		case got := <-result:
 			deadline.stop()
 			cancel()
-			if c.closed.Load() {
-				return 0, io.ErrClosedPipe
-			}
 			if got.err != nil {
+				// Close cancels the connection context, which surfaces here as a
+				// transport error; report the lifecycle error instead. Only
+				// failures are translated: a completed 204 means the bytes were
+				// delivered, and that success must not become an error that
+				// invites the caller to retry and duplicate them.
+				if c.closed.Load() {
+					return 0, io.ErrClosedPipe
+				}
 				return 0, got.err
 			}
 			if got.status != http.StatusNoContent {
@@ -227,15 +232,13 @@ func (c *sseClientConn) Write(b []byte) (int, error) {
 }
 
 func (c *sseClientConn) Close() error {
-	if c.closed.Swap(true) {
-		return nil
-	}
 	// Release a blocked stream read immediately. The dial context no longer owns
 	// this request after establishment; Close is its lifetime boundary. Canceling
 	// the stream also tears down the server session, so Close does not wait behind
-	// writeMu to send a redundant close POST.
-	c.cancel()
-	c.sseResp.Body.Close()
+	// writeMu to send a redundant close POST. Recording net.ErrClosed as the
+	// terminal error first makes reads after a local Close deterministic: the
+	// decode error this teardown provokes loses the race and is discarded.
+	c.setTerminalError(net.ErrClosed)
 	return nil
 }
 
@@ -350,9 +353,10 @@ func (c *sseServerConn) deliver(ctx context.Context, data []byte) error {
 func (c *sseServerConn) writeEvent(ev eventsource.Event) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	// Close marks the connection closed before emitting its final event. No
-	// other event may be written after that point.
-	if c.closed.Load() && ev.Type != "close" {
+	// Once shutdown marks the connection closed no event of any type may be
+	// written: finishResponse may return at that point, after which the
+	// ResponseWriter must not be touched.
+	if c.closed.Load() {
 		return io.ErrClosedPipe
 	}
 	if c.writeDeadline.expired() {

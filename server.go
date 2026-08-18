@@ -207,7 +207,10 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 	}
 	sess := val.(*sseSession)
 	if r.URL.Query().Get("close") == "1" {
-		sess.conn.Close()
+		// A close POST is the peer ending the connection, not a local Close.
+		// Reads observe it as a clean EOF, exactly like an orderly remote
+		// stream teardown.
+		sess.conn.shutdown(io.EOF)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
