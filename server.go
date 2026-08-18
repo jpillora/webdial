@@ -129,21 +129,21 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	sid := generateSessionID()
-	pr, pw := io.Pipe()
 	conn := &sseServerConn{
-		sessionID:  sid,
-		w:          w,
-		readPipe:   pr,
-		writePipe:  pw,
-		closeCh:    make(chan struct{}),
-		localAddr:  addr{transport: "sse", url: "server"},
-		remoteAddr: addr{transport: "sse", url: r.RemoteAddr},
+		sessionID:     sid,
+		w:             w,
+		response:      http.NewResponseController(w),
+		inbound:       make(chan []byte),
+		readDeadline:  newConnDeadline(),
+		writeDeadline: newConnDeadline(),
+		closeCh:       make(chan struct{}),
+		localAddr:     addr{transport: "sse", url: "server"},
+		remoteAddr:    addr{transport: "sse", url: r.RemoteAddr},
 	}
 	s.sessions.Store(sid, &sseSession{conn: conn})
 	defer func() {
 		conn.finishResponse()
 		s.sessions.Delete(sid)
-		pw.Close()
 	}()
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -205,7 +205,10 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if ping := r.URL.Query().Get("ping"); ping != "" {
-		sess.conn.writePong([]byte(ping))
+		if err := sess.conn.writePong([]byte(ping)); err != nil {
+			http.Error(w, "connection write failed", http.StatusGone)
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -214,6 +217,9 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "read error", http.StatusInternalServerError)
 		return
 	}
-	sess.conn.writePipe.Write(body)
+	if err := sess.conn.deliver(r.Context(), body); err != nil {
+		http.Error(w, "connection delivery failed", http.StatusGone)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }

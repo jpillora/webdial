@@ -180,8 +180,8 @@ func TestSSESIDWriteFailureIsNotAccepted(t *testing.T) {
 	})
 	require.Zero(t, sessionCount)
 
-	_, err := conn.readPipe.Read(make([]byte, 1))
+	_, err := conn.Read(make([]byte, 1))
 	require.Error(t, err)
-	_, err = conn.writePipe.Write([]byte("data"))
+	err = conn.deliver(context.Background(), []byte("data"))
 	require.Error(t, err)
 }
