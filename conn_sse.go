@@ -279,6 +279,9 @@ type sseServerConn struct {
 	writeDeadline connDeadline
 	writeMu       sync.Mutex
 	closed        atomic.Bool
+	shutdownOnce  sync.Once
+	readErrMu     sync.Mutex
+	readErr       error
 	closeCh       chan struct{}
 	localAddr     addr
 	remoteAddr    addr
@@ -295,7 +298,7 @@ func (c *sseServerConn) Read(b []byte) (int, error) {
 			return c.readBuf.Read(b)
 		}
 		if c.closed.Load() {
-			return 0, net.ErrClosed
+			return 0, c.shutdownReadError()
 		}
 		deadline := c.readDeadline.snapshot()
 		if deadline.expired {
@@ -310,7 +313,7 @@ func (c *sseServerConn) Read(b []byte) (int, error) {
 			c.readBuf.Write(data)
 		case <-c.closeCh:
 			deadline.stop()
-			return 0, net.ErrClosed
+			return 0, c.shutdownReadError()
 		case <-deadline.timerC():
 			if c.readDeadline.expired() {
 				return 0, os.ErrDeadlineExceeded
@@ -330,6 +333,9 @@ func (c *sseServerConn) deliver(ctx context.Context, data []byte) error {
 	}
 	select {
 	case c.inbound <- data:
+		// The unbuffered handoff is the delivery commit point. Once a Read has
+		// accepted these bytes, a concurrent shutdown must not turn success into
+		// an error that invites the caller to retry and duplicate them.
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -359,7 +365,10 @@ func (c *sseServerConn) writeEvent(ev eventsource.Event) error {
 // HTTP handler that owns the ResponseWriter. Marking the connection first
 // rejects future writes; taking writeMu waits for a write already in flight.
 func (c *sseServerConn) finishResponse() {
-	c.shutdown()
+	// The streaming request has ended from the peer's point of view. Preserve
+	// normal net.Conn read semantics: buffered data is returned first, followed
+	// by EOF. A local Close records net.ErrClosed before this defer can run.
+	c.shutdown(io.EOF)
 	c.writeMu.Lock()
 	c.writeMu.Unlock()
 }
@@ -389,21 +398,40 @@ func (c *sseServerConn) writePong(ts []byte) error {
 }
 
 func (c *sseServerConn) Close() error {
-	c.shutdown()
+	c.shutdown(net.ErrClosed)
 	return nil
 }
 
-func (c *sseServerConn) shutdown() {
-	if !c.closed.CompareAndSwap(false, true) {
-		return
+func (c *sseServerConn) shutdown(readErr error) {
+	c.shutdownOnce.Do(func() {
+		if readErr == nil {
+			readErr = net.ErrClosed
+		}
+		c.readErrMu.Lock()
+		c.readErr = readErr
+		c.readErrMu.Unlock()
+		c.closed.Store(true)
+		// Release reads, POST delivery, and the owning handler before attempting
+		// to interrupt a response write. Concurrent shutdown callers wait in
+		// shutdownOnce, so the handler still cannot return prematurely.
+		close(c.closeCh)
+
+		// Force an in-flight ResponseWriter call to return before the owning HTTP
+		// handler finishes. If the controller is unsupported, finishResponse waits
+		// for writeMu instead; keeping the handler alive is the only safe fallback.
+		c.responseMu.Lock()
+		_ = c.response.SetWriteDeadline(time.Now())
+		c.responseMu.Unlock()
+	})
+}
+
+func (c *sseServerConn) shutdownReadError() error {
+	c.readErrMu.Lock()
+	defer c.readErrMu.Unlock()
+	if c.readErr == nil {
+		return net.ErrClosed
 	}
-	// Force an in-flight ResponseWriter call to return before the owning HTTP
-	// handler finishes. Ignore ErrNotSupported here; SetWriteDeadline reports it
-	// to callers, while shutdown must remain idempotent and best effort.
-	c.responseMu.Lock()
-	_ = c.response.SetWriteDeadline(time.Now())
-	c.responseMu.Unlock()
-	close(c.closeCh)
+	return c.readErr
 }
 
 func (c *sseServerConn) LocalAddr() net.Addr  { return c.localAddr }

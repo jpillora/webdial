@@ -190,7 +190,7 @@ func TestSSEServerCloseInterruptsBlockedRead(t *testing.T) {
 	waitForContextSignal(t, readStarted, "server read to start")
 
 	require.NoError(t, pair.server.Close())
-	require.Error(t, waitForIOResult(t, read, "blocked server read to stop").err)
+	require.ErrorIs(t, waitForIOResult(t, read, "blocked server read to stop").err, net.ErrClosed)
 }
 
 // deadlineBlockingResponseWriter deterministically models a ResponseWriter
