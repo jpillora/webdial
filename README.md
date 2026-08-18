@@ -40,6 +40,30 @@ for {
 
 `srv.Accept()` returns a `net.Conn`. Use it with any protocol that works over a byte stream.
 
+#### WebSocket origin policy
+
+WebSocket handshakes use a secure same-origin policy by default. Browser requests
+whose `Origin` host does not match the request `Host` are rejected; non-browser
+clients that omit `Origin`, including the Go and Node.js clients, are accepted.
+
+If a trusted web application is hosted on a different origin, configure an
+explicit allowlist on that server:
+
+```go
+srv.CheckOrigin = func(r *http.Request) bool {
+    switch r.Header.Get("Origin") {
+    case "https://app.example.com", "https://admin.example.com":
+        return true
+    default:
+        return false
+    }
+}
+```
+
+Cross-origin WebSockets should also be protected with explicit authentication.
+Avoid a blanket `return true`: browsers do not apply CORS protections to
+WebSocket handshakes.
+
 ### Client
 
 ```go

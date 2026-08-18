@@ -14,15 +14,16 @@ import (
 	"github.com/jpillora/eventsource"
 )
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin:       func(r *http.Request) bool { return true },
-	EnableCompression: true, // per-message deflate (RFC 7692); browser decompresses natively
-}
-
 type Server struct {
 	// KeepAlive is the interval between keep-alive pings.
 	// Zero means 25 seconds. Negative means disabled.
 	KeepAlive time.Duration
+	// CheckOrigin, when non-nil, validates the Origin header of WebSocket
+	// upgrade requests. A nil function uses Gorilla WebSocket's secure default:
+	// requests without an Origin are accepted, while requests with an Origin
+	// must have an Origin host matching the request Host. CheckOrigin may be
+	// called concurrently and must be safe for concurrent use.
+	CheckOrigin func(*http.Request) bool
 	// CompressionLevel is the flate level for per-message WS compression
 	// (1-9, or flate.DefaultCompression). Zero means flate.BestSpeed.
 	CompressionLevel int
@@ -107,6 +108,13 @@ func (s *Server) writeTimeout() time.Duration {
 }
 
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
+	// The upgrader is request-local so different Server instances can safely
+	// use different origin policies. Leaving CheckOrigin nil deliberately uses
+	// Gorilla's same-origin default.
+	upgrader := websocket.Upgrader{
+		CheckOrigin:       s.CheckOrigin,
+		EnableCompression: true, // per-message deflate (RFC 7692); browser decompresses natively
+	}
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return

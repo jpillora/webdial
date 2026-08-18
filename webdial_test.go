@@ -39,6 +39,82 @@ func TestWSTransport(t *testing.T) {
 	require.NotNil(t, conn.LocalAddr())
 }
 
+func TestWebSocketDefaultOriginPolicy(t *testing.T) {
+	srv := NewServer()
+	defer srv.Close()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	wsURL := strings.Replace(ts.URL, "http://", "ws://", 1)
+
+	tests := []struct {
+		name       string
+		origin     string
+		wantStatus int
+	}{
+		{
+			name:       "same origin",
+			origin:     ts.URL,
+			wantStatus: http.StatusSwitchingProtocols,
+		},
+		{
+			name:       "foreign origin",
+			origin:     "https://attacker.example",
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name:       "absent origin",
+			wantStatus: http.StatusSwitchingProtocols,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			header := http.Header{}
+			if tt.origin != "" {
+				header.Set("Origin", tt.origin)
+			}
+			ws, resp, err := websocket.DefaultDialer.Dial(wsURL, header)
+			require.NotNil(t, resp)
+			defer resp.Body.Close()
+			require.Equal(t, tt.wantStatus, resp.StatusCode)
+
+			if tt.wantStatus != http.StatusSwitchingProtocols {
+				require.Error(t, err)
+				return
+			}
+
+			require.NoError(t, err)
+			defer ws.Close()
+			accepted, err := srv.Accept()
+			require.NoError(t, err)
+			require.NoError(t, accepted.Close())
+		})
+	}
+}
+
+func TestWebSocketOriginPolicyOverride(t *testing.T) {
+	const allowedOrigin = "https://app.example.com"
+	srv := NewServer()
+	srv.CheckOrigin = func(r *http.Request) bool {
+		return r.Header.Get("Origin") == allowedOrigin
+	}
+	defer srv.Close()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	wsURL := strings.Replace(ts.URL, "http://", "ws://", 1)
+
+	header := http.Header{"Origin": []string{allowedOrigin}}
+	ws, resp, err := websocket.DefaultDialer.Dial(wsURL, header)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	defer ws.Close()
+	accepted, err := srv.Accept()
+	require.NoError(t, err)
+	require.NoError(t, accepted.Close())
+}
+
 func TestSSETransport(t *testing.T) {
 	srv := NewServer()
 	defer srv.Close()
