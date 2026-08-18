@@ -146,10 +146,13 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	}()
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
-	eventsource.WriteEvent(w, eventsource.Event{
+	if err := conn.writeEvent(eventsource.Event{
 		Type: "sid",
 		Data: []byte(sid),
-	})
+	}); err != nil {
+		conn.Close()
+		return
+	}
 	select {
 	case s.acceptCh <- conn:
 	case <-s.closed:
