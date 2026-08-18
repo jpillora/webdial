@@ -32,14 +32,15 @@ const url = await new Promise((resolve, reject) => {
   });
 });
 
-const opts = { transport: "ws", pingIntervalMs: PING_MS, pongTimeoutMs: TIMEOUT_MS };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let failed = false;
 
 try {
-  {
-    console.log("test data keeps a pong-less connection alive...");
-    const conn = await dial(`${url}/talking`, opts);
+  for (const transport of ["ws", "sse"]) {
+    const opts = { transport, pingIntervalMs: PING_MS, pongTimeoutMs: TIMEOUT_MS };
+
+    console.log(`test ${transport} data keeps a pong-less connection alive...`);
+    let conn = await dial(`${url}/talking`, opts);
     // Read enough to outlive several pong timeouts, in the shape that matters:
     // frames keep arriving and no pong ever does.
     const deadline = Date.now() + TIMEOUT_MS * 5;
@@ -53,17 +54,29 @@ try {
     assert.equal(conn.latency, null, "the server under test must never have answered a ping");
     await conn.close();
     console.log(`  pass (${frames} frames, no pong)`);
-  }
 
-  {
-    console.log("test a peer that says nothing is still closed...");
-    const conn = await dial(`${url}/silent`, opts);
-    const read = conn.read();
-    const closed = await Promise.race([
-      read.then(() => "eof"),
+    console.log(`test ${transport} finite data does not disable the watchdog...`);
+    conn = await dial(`${url}/burst`, opts);
+    const frame = await Promise.race([
+      conn.read(),
+      sleep(TIMEOUT_MS * 5).then(() => "timeout"),
+    ]);
+    assert.notEqual(frame, "timeout", "finite data frame never arrived");
+    assert.equal(new TextDecoder().decode(frame), "frame");
+    const afterBurst = await Promise.race([
+      conn.read().then((data) => data === null ? "eof" : "data"),
       sleep(TIMEOUT_MS * 10).then(() => "timeout"),
     ]);
-    assert.equal(closed, "eof", "watchdog never fired for a peer that sent nothing at all");
+    assert.equal(afterBurst, "eof", "finite data permanently disabled the watchdog");
+    console.log("  pass");
+
+    console.log(`test a silent ${transport} peer is still closed...`);
+    conn = await dial(`${url}/silent`, opts);
+    const silent = await Promise.race([
+      conn.read().then((data) => data === null ? "eof" : "data"),
+      sleep(TIMEOUT_MS * 10).then(() => "timeout"),
+    ]);
+    assert.equal(silent, "eof", "watchdog never fired for a peer that sent nothing at all");
     console.log("  pass");
   }
 
