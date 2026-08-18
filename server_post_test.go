@@ -45,18 +45,20 @@ func (*signalingReadCloser) Close() error { return nil }
 
 func newPostTestSession(t *testing.T, srv *Server) (*sseServerConn, string) {
 	t.Helper()
-	pr, pw := io.Pipe()
+	w := httptest.NewRecorder()
 	conn := &sseServerConn{
-		readPipe:  pr,
-		writePipe: pw,
-		closeCh:   make(chan struct{}),
+		w:             w,
+		response:      http.NewResponseController(w),
+		inbound:       make(chan []byte),
+		readDeadline:  newConnDeadline(),
+		writeDeadline: newConnDeadline(),
+		closeCh:       make(chan struct{}),
 	}
 	sid := "post-test-session"
 	srv.sessions.Store(sid, newSSESession(conn))
 	t.Cleanup(func() {
 		srv.sessions.Delete(sid)
-		_ = pr.Close()
-		_ = pw.Close()
+		_ = conn.Close()
 	})
 	return conn, sid
 }
@@ -130,7 +132,7 @@ func TestSSEPostRejectsOversizedChunkedBody(t *testing.T) {
 	validReq := httptest.NewRequest(http.MethodPost, "/?s="+sid, bytes.NewReader(valid))
 	result, _ := servePostAsync(srv, validReq)
 	got := make([]byte, len(valid))
-	_, err := io.ReadFull(conn.readPipe, got)
+	_, err := io.ReadFull(conn, got)
 	require.NoError(t, err)
 	require.Equal(t, valid, got)
 	require.Equal(t, http.StatusNoContent, waitPostResult(t, result).Code)
@@ -150,7 +152,7 @@ func TestSSEPostDeliversBinaryPayloadAtLimit(t *testing.T) {
 	result, _ := servePostAsync(srv, req)
 
 	got := make([]byte, len(payload))
-	_, err := io.ReadFull(conn.readPipe, got)
+	_, err := io.ReadFull(conn, got)
 	require.NoError(t, err)
 	require.Equal(t, payload, got)
 	require.Equal(t, http.StatusNoContent, waitPostResult(t, result).Code)
@@ -182,14 +184,21 @@ func TestSSEPostCancellationUnblocksSlowReader(t *testing.T) {
 		t.Fatal("canceled POST remained blocked on slow application reader")
 	}
 	require.Equal(t, http.StatusRequestTimeout, (<-result).Code)
-	_, err := conn.readPipe.Read(make([]byte, 1))
-	require.ErrorIs(t, err, context.Canceled)
+	require.False(t, conn.closed.Load(), "a canceled POST with no delivered prefix should not poison the session")
+
+	nextReq := httptest.NewRequest(http.MethodPost, "/?s="+sid, bytes.NewReader([]byte("ok")))
+	nextResult, _ := servePostAsync(srv, nextReq)
+	got := make([]byte, 2)
+	_, err := io.ReadFull(conn, got)
+	require.NoError(t, err)
+	require.Equal(t, "ok", string(got))
+	require.Equal(t, http.StatusNoContent, waitPostResult(t, nextResult).Code)
 }
 
 func TestSSEPostReturnsDeliveryError(t *testing.T) {
 	srv := NewServer()
 	conn, sid := newPostTestSession(t, srv)
-	require.NoError(t, conn.readPipe.Close())
+	require.NoError(t, conn.Close())
 	req := httptest.NewRequest(http.MethodPost, "/?s="+sid, bytes.NewReader([]byte("data")))
 	w := httptest.NewRecorder()
 
@@ -231,7 +240,7 @@ func TestSSEConcurrentPostsAreSerialized(t *testing.T) {
 	}
 
 	gotFirst := make([]byte, len(first))
-	_, err := io.ReadFull(conn.readPipe, gotFirst)
+	_, err := io.ReadFull(conn, gotFirst)
 	require.NoError(t, err)
 	require.Equal(t, first, gotFirst)
 	require.Equal(t, http.StatusNoContent, waitPostResult(t, firstResult).Code)
@@ -242,7 +251,7 @@ func TestSSEConcurrentPostsAreSerialized(t *testing.T) {
 		t.Fatal("second POST did not start after first POST completed")
 	}
 	gotSecond := make([]byte, len(second))
-	_, err = io.ReadFull(conn.readPipe, gotSecond)
+	_, err = io.ReadFull(conn, gotSecond)
 	require.NoError(t, err)
 	require.Equal(t, second, gotSecond)
 	require.Equal(t, http.StatusNoContent, waitPostResult(t, secondResult).Code)

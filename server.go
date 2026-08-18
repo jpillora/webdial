@@ -136,21 +136,21 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	sid := generateSessionID()
-	pr, pw := io.Pipe()
 	conn := &sseServerConn{
-		sessionID:  sid,
-		w:          w,
-		readPipe:   pr,
-		writePipe:  pw,
-		closeCh:    make(chan struct{}),
-		localAddr:  addr{transport: "sse", url: "server"},
-		remoteAddr: addr{transport: "sse", url: r.RemoteAddr},
+		sessionID:     sid,
+		w:             w,
+		response:      http.NewResponseController(w),
+		inbound:       make(chan []byte),
+		readDeadline:  newConnDeadline(),
+		writeDeadline: newConnDeadline(),
+		closeCh:       make(chan struct{}),
+		localAddr:     addr{transport: "sse", url: "server"},
+		remoteAddr:    addr{transport: "sse", url: r.RemoteAddr},
 	}
 	s.sessions.Store(sid, newSSESession(conn))
 	defer func() {
 		conn.finishResponse()
 		s.sessions.Delete(sid)
-		pw.Close()
 	}()
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -245,41 +245,61 @@ func (s *Server) handlePostData(w http.ResponseWriter, r *http.Request, sess *ss
 	var body io.Reader = r.Body
 	if limit >= 0 {
 		body = http.MaxBytesReader(w, r.Body, limit)
-		// A chunked body has no trustworthy size up front. Buffering at most the
-		// configured limit lets us reject it without delivering a partial POST.
-		if r.ContentLength < 0 {
-			buffered, err := io.ReadAll(body)
-			if err != nil {
-				writePostReadError(w, err)
-				return
-			}
-			body = bytes.NewReader(buffered)
+		// Buffer bounded bodies before delivery. Besides enforcing the limit for
+		// chunked or dishonest requests, this prevents a rejected request from
+		// contaminating the connection with a successfully delivered prefix.
+		buffered, err := io.ReadAll(body)
+		if err != nil {
+			writePostReadError(w, err)
+			return
 		}
+		body = bytes.NewReader(buffered)
 	}
 
-	// An io.Pipe write waits for the application to read. If the HTTP client
-	// disappears while that write is blocked, fail the inbound stream to wake
-	// both sides instead of leaking this handler goroutine.
-	cancelFinished := make(chan struct{})
-	stopCancel := context.AfterFunc(r.Context(), func() {
-		defer close(cancelFinished)
-		sess.conn.writePipe.CloseWithError(r.Context().Err())
-	})
-	_, err := io.Copy(sess.conn.writePipe, body)
-	if !stopCancel() {
-		<-cancelFinished
-	}
+	delivered, err := deliverPostBody(r.Context(), sess.conn, body)
 	if err == nil {
 		err = r.Context().Err()
 	}
 	if err != nil {
-		// A streamed POST may already have delivered a prefix. Terminate the
-		// inbound byte stream so a retry cannot silently duplicate that prefix.
-		sess.conn.writePipe.CloseWithError(err)
+		// A streamed unlimited POST may already have delivered a prefix. In that
+		// case terminate the session so a retry cannot silently duplicate bytes.
+		if delivered {
+			sess.conn.shutdown()
+		}
 		writePostDeliveryError(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func deliverPostBody(ctx context.Context, conn *sseServerConn, body io.Reader) (bool, error) {
+	delivered := false
+	for {
+		// Each successful send owns its backing array. The receiving Read may not
+		// copy from the slice until after deliver returns, so reusing this buffer
+		// would race with the next body read and could corrupt the byte stream.
+		chunk := make([]byte, 32<<10)
+		n, readErr := body.Read(chunk)
+		if n > 0 {
+			if err := conn.deliver(ctx, chunk[:n]); err != nil {
+				return delivered, err
+			}
+			delivered = true
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return delivered, nil
+			}
+			return delivered, readErr
+		}
+		if n == 0 {
+			select {
+			case <-ctx.Done():
+				return delivered, ctx.Err()
+			default:
+			}
+		}
+	}
 }
 
 func writePostReadError(w http.ResponseWriter, err error) {
@@ -298,7 +318,7 @@ func writePostDeliveryError(w http.ResponseWriter, r *http.Request, err error) {
 		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 	case r.Context().Err() != nil:
 		http.Error(w, "request canceled", http.StatusRequestTimeout)
-	case errors.Is(err, io.ErrClosedPipe):
+	case errors.Is(err, io.ErrClosedPipe), errors.Is(err, net.ErrClosed):
 		http.Error(w, "session closed", http.StatusGone)
 	default:
 		http.Error(w, "delivery error", http.StatusInternalServerError)

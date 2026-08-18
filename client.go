@@ -86,7 +86,7 @@ func dialSSE(ctx context.Context, baseURL string) (net.Conn, error) {
 		return nil, ctx.Err()
 	}
 	sid := string(ev.Data)
-	conn, err := newSSEClientConn(baseURL, sid, resp, decoder, client, cancelStream)
+	conn, err := newSSEClientConn(baseURL, sid, resp, decoder, client, streamCtx, cancelStream)
 	if err != nil {
 		resp.Body.Close()
 		cancelStream()
