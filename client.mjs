@@ -71,7 +71,6 @@ class WSConn {
   #latency = null;
   #pingTimer = null;
   #pingSentAt = null;
-  #lastRecvAt = 0;
   #pingInterval = PING_INTERVAL_MS;
   #pongTimeout = PONG_TIMEOUT_MS;
   onLatency = null;
@@ -92,7 +91,11 @@ class WSConn {
       } else {
         this.#queue.push(data);
       }
-      this.#lastRecvAt = performance.now();
+      // Any data from the peer answers the current liveness question just as
+      // conclusively as a pong. Clear that probe so the next interval starts
+      // a fresh timeout window; retaining its timestamp would make this one
+      // frame permanent evidence that the peer is alive.
+      this.#pingSentAt = null;
     };
     ws.onclose = () => {
       this.#closed = true;
@@ -179,19 +182,10 @@ class WSConn {
 
   #stale() {
     if (this.#pingSentAt === null) return false;
-    // Frames the caller has not read yet are the same evidence, and they
-    // survive the case #lastRecvAt cannot cover: while a slow consumer drains
-    // the queue in one uninterrupted run of microtasks, neither onmessage nor
-    // this timer gets to run, and which of them the event loop reaches first
-    // afterwards is not ours to decide.
+    // Frames the caller has not read yet are evidence that the peer was alive,
+    // and prevent the watchdog from closing a working connection while a slow
+    // consumer drains its backlog.
     if (this.#queue.length > 0) return false;
-    // Data arriving after the ping went out proves the peer is there, so the
-    // missing pong is queued rather than lost. That is the normal state of a
-    // connection whose peer is sending faster than this end can consume: the
-    // pong sits behind the backlog, and every frame still to come is evidence
-    // against the conclusion that nobody is home. Closing here would tear down
-    // a working connection precisely when it is busiest.
-    if (this.#lastRecvAt > this.#pingSentAt) return false;
     return performance.now() - this.#pingSentAt > this.#pongTimeout;
   }
 
@@ -285,7 +279,6 @@ class SSEConn {
   #latency = null;
   #pingTimer = null;
   #pingSentAt = null;
-  #lastRecvAt = 0;
   #pingInterval = PING_INTERVAL_MS;
   #pongTimeout = PONG_TIMEOUT_MS;
   onLatency = null;
@@ -313,7 +306,10 @@ class SSEConn {
         return null;
       }
       if (ev.event === "d") {
-        this.#lastRecvAt = performance.now();
+        // Data satisfies the outstanding liveness probe. The next timer tick
+        // must create a new probe so a finite burst cannot keep a dead peer
+        // alive forever.
+        this.#pingSentAt = null;
         return base64Decode(ev.data);
       }
       if (ev.event === "pong") {
@@ -384,13 +380,6 @@ class SSEConn {
 
   #stale() {
     if (this.#pingSentAt === null) return false;
-    // Data arriving after the ping went out proves the peer is there, so the
-    // missing pong is queued rather than lost. That is the normal state of a
-    // connection whose peer is sending faster than this end can consume: the
-    // pong sits behind the backlog, and every frame still to come is evidence
-    // against the conclusion that nobody is home. Closing here would tear down
-    // a working connection precisely when it is busiest.
-    if (this.#lastRecvAt > this.#pingSentAt) return false;
     return performance.now() - this.#pingSentAt > this.#pongTimeout;
   }
 
