@@ -8,7 +8,7 @@ const PING_INTERVAL_MS = 5000;
 // in background tabs, but message delivery is not, so a live peer still clears
 // this well before the deadline.
 const PONG_TIMEOUT_MS = 3 * PING_INTERVAL_MS;
-const SSE_MAX_BUFFERED_BYTES = 1024 * 1024;
+const MAX_BUFFERED_BYTES = 1024 * 1024;
 // A byte limit alone does not bound the bookkeeping for empty data events.
 const SSE_MAX_BUFFERED_EVENTS = 1024;
 
@@ -22,26 +22,57 @@ function base64Decode(str) {
   return bytes;
 }
 
+const TRANSPORTS = { ws: dialWS, sse: dialSSE, wt: dialWT };
+
+// WebTransport is deliberately absent: it needs an HTTP/3 listener on a
+// separate UDP port, so probing it by default would cost every dial a failed
+// connection attempt everywhere it is not deployed — and in exactly the
+// networks this library exists for, that failure arrives only after a QUIC
+// handshake timeout.
+const DEFAULT_CHAIN = ["ws", "sse"];
+
 /**
  * Dial connects to a webdial server.
- * Tries WebSocket first, falls back to SSE+POST.
+ * Tries WebSocket first, falls back to SSE+POST. WebTransport is opt-in.
  * @param {string} baseURL
- * @param {{ transport?: 'ws' | 'sse', pingIntervalMs?: number, pongTimeoutMs?: number, maxBufferedBytes?: number }} [opts]
+ * @param {{ transport?: 'ws' | 'sse' | 'wt' | Array<'ws'|'sse'|'wt'>, pingIntervalMs?: number, pongTimeoutMs?: number, maxBufferedBytes?: number, wtURL?: string, wt?: object }} [opts]
+ *   transport names one transport, or an ordered list to try in turn.
  *   pingIntervalMs paces the keep-alive; pongTimeoutMs is how long an
  *   unanswered ping stands before the connection is presumed dead (default
- *   three intervals). maxBufferedBytes limits decoded SSE data waiting for a
+ *   three intervals). maxBufferedBytes limits buffered data waiting for a
  *   reader (default 1 MiB); SSE also caps the backlog at 1024 data events.
+ *   wtURL overrides the endpoint used for WebTransport, whose HTTP/3 listener
+ *   is often on a different port; wt is passed to the WebTransport
+ *   constructor, for options such as serverCertificateHashes.
  * @returns {Promise<WebDialConn>}
  */
 export async function dial(baseURL, opts) {
-  const transport = opts?.transport;
-  if (transport === "sse") return dialSSE(baseURL, opts);
-  if (transport === "ws") return dialWS(baseURL, opts);
-  try {
-    return await dialWS(baseURL, opts);
-  } catch {
-    return await dialSSE(baseURL, opts);
+  const chain = transportChain(opts?.transport);
+  let lastErr;
+  for (const name of chain) {
+    try {
+      return await TRANSPORTS[name](baseURL, opts);
+    } catch (err) {
+      lastErr = err;
+    }
   }
+  throw lastErr;
+}
+
+function transportChain(transport) {
+  if (transport === undefined || transport === null) return DEFAULT_CHAIN;
+  const chain = Array.isArray(transport) ? transport : [transport];
+  if (chain.length === 0) {
+    throw new TypeError("webdial: transport list is empty");
+  }
+  for (const name of chain) {
+    // An unrecognised name used to fall through to the automatic chain, so a
+    // typo quietly connected over some other transport instead.
+    if (!Object.hasOwn(TRANSPORTS, name)) {
+      throw new TypeError(`webdial: unknown transport ${JSON.stringify(name)}`);
+    }
+  }
+  return chain;
 }
 
 // --- WebSocket transport ---
@@ -237,7 +268,7 @@ class WSConn {
 
 async function dialSSE(baseURL, opts) {
   const maxBufferedBytes =
-    opts?.maxBufferedBytes ?? SSE_MAX_BUFFERED_BYTES;
+    opts?.maxBufferedBytes ?? MAX_BUFFERED_BYTES;
   if (!Number.isSafeInteger(maxBufferedBytes) || maxBufferedBytes < 0) {
     throw new TypeError(
       "webdial: maxBufferedBytes must be a non-negative safe integer",
@@ -318,7 +349,7 @@ class SSEConn {
   #pingSentAt = null;
   #pingInterval = PING_INTERVAL_MS;
   #pongTimeout = PONG_TIMEOUT_MS;
-  #maxBufferedBytes = SSE_MAX_BUFFERED_BYTES;
+  #maxBufferedBytes = MAX_BUFFERED_BYTES;
   onLatency = null;
 
   constructor(baseURL, sid, decoder, opts, maxBufferedBytes) {
@@ -499,6 +530,288 @@ class SSEConn {
   }
   get transport() {
     return "sse";
+  }
+  get url() {
+    return this.#url;
+  }
+}
+
+// --- WebTransport transport ---
+
+async function dialWT(baseURL, opts) {
+  // Absence is the common case outside Chromium, so it is reported as a plain
+  // failure rather than a thrown ReferenceError from the constructor.
+  if (typeof globalThis.WebTransport !== "function") {
+    throw new Error("webdial: WebTransport is not supported");
+  }
+  const maxBufferedBytes = opts?.maxBufferedBytes ?? MAX_BUFFERED_BYTES;
+  if (!Number.isSafeInteger(maxBufferedBytes) || maxBufferedBytes < 0) {
+    throw new TypeError(
+      "webdial: maxBufferedBytes must be a non-negative safe integer",
+    );
+  }
+  // The HTTP/3 listener usually sits on a different port from the page, so the
+  // endpoint may be overridden without disturbing the reported url.
+  const url = webtransportURL(opts?.wtURL ?? baseURL);
+  const wt = new WebTransport(url, opts?.wt);
+  try {
+    await wt.ready;
+  } catch (err) {
+    throw new Error("webdial: webtransport connection failed", { cause: err });
+  }
+  const stream = await wt.createBidirectionalStream();
+  return new WTConn(wt, stream, baseURL, opts, maxBufferedBytes);
+}
+
+function webtransportURL(baseURL) {
+  const url = parseURL(baseURL);
+  // Unlike websocketURL, which leaves unknown schemes alone, anything that is
+  // not http(s) is rejected here: WebTransport has no cleartext form, and the
+  // alternative is an opaque failure inside the QUIC handshake.
+  if (url.protocol === "http:") url.protocol = "https:";
+  else if (url.protocol !== "https:") {
+    throw new TypeError(
+      `webdial: webtransport requires an https URL, got ${url.protocol}`,
+    );
+  }
+  return url.href;
+}
+
+class WTConn {
+  #wt;
+  #stream;
+  #reader;
+  #writer;
+  #datagramWriter = null;
+  #queue = [];
+  #queuedBytes = 0;
+  #waiters = [];
+  #resume = null;
+  #closed = false;
+  #closeErr = null;
+  #url;
+  #latency = null;
+  #pingTimer = null;
+  #pingSentAt = null;
+  #pingInterval = PING_INTERVAL_MS;
+  #pongTimeout = PONG_TIMEOUT_MS;
+  #maxBufferedBytes = MAX_BUFFERED_BYTES;
+  onLatency = null;
+
+  constructor(wt, stream, url, opts, maxBufferedBytes) {
+    this.#wt = wt;
+    this.#stream = stream;
+    this.#url = url;
+    this.#maxBufferedBytes = maxBufferedBytes ?? MAX_BUFFERED_BYTES;
+    this.#pingInterval = opts?.pingIntervalMs ?? PING_INTERVAL_MS;
+    this.#pongTimeout = opts?.pongTimeoutMs ?? this.#pingInterval * 3;
+    this.#reader = stream.readable.getReader();
+    // getWriter locks the stream, so the writer is acquired once and reused
+    // rather than per write.
+    this.#writer = stream.writable.getWriter();
+    // Opening a stream is local, and its WebTransport header may not reach the
+    // server until the first write. Flushing an empty chunk makes the stream
+    // visible so the server can accept it before either side sends data.
+    this.#writer.write(new Uint8Array(0)).catch(() => {});
+    // The session can die while no read is outstanding, so EOF and errors have
+    // to arrive through here rather than only through the read path.
+    wt.closed?.then?.(
+      () => this.#finish(null),
+      (err) => this.#finish(err),
+    );
+    this.#startPing();
+    void this.#pump();
+    void this.#datagramPump();
+  }
+
+  /** @returns {Promise<Uint8Array|null>} null on EOF/close */
+  async read() {
+    if (this.#queue.length > 0) return this.#take();
+    if (this.#closed) {
+      if (this.#closeErr) throw this.#closeErr;
+      return null;
+    }
+    return new Promise((resolve, reject) => {
+      this.#waiters.push({ resolve, reject });
+    });
+  }
+
+  /** @param {Uint8Array|string} data */
+  async write(data) {
+    if (this.#closed) throw new Error("webdial: connection closed");
+    if (typeof data === "string") data = new TextEncoder().encode(data);
+    // ready resolves when the stream can accept more, which is what applies
+    // QUIC back-pressure to a caller that outruns the peer.
+    await this.#writer.ready;
+    await this.#writer.write(data);
+  }
+
+  async close() {
+    if (this.#closed) return;
+    // Set closed before awaiting anything, so a concurrent close returns here
+    // and the peer-facing teardown below runs exactly once.
+    this.#finish(null);
+    this.#reader.cancel().catch(() => {});
+    try {
+      await this.#writer.close();
+    } catch {
+      // A session that already failed cannot flush; closing it is all that is
+      // left to do.
+    }
+    try {
+      this.#wt.close();
+    } catch {}
+  }
+
+  #take() {
+    const data = this.#queue.shift();
+    this.#queuedBytes -= data.byteLength;
+    // Room again: let the pump resume pulling from the stream.
+    if (this.#resume && this.#queuedBytes < this.#maxBufferedBytes) {
+      const resume = this.#resume;
+      this.#resume = null;
+      resume();
+    }
+    return data;
+  }
+
+  // pump owns the reader. Unlike SSE, which must fail a connection whose
+  // backlog overflows because the server has already pushed the bytes,
+  // WebTransport can simply stop pulling: the unread data stays in the peer's
+  // flow-control window and slows the sender instead.
+  async #pump() {
+    try {
+      while (!this.#closed) {
+        if (this.#queuedBytes >= this.#maxBufferedBytes) {
+          await new Promise((resolve) => {
+            this.#resume = resolve;
+          });
+          continue;
+        }
+        const { value, done } = await this.#reader.read();
+        if (done) {
+          this.#finish(null);
+          return;
+        }
+        const data = new Uint8Array(
+          value.buffer,
+          value.byteOffset,
+          value.byteLength,
+        );
+        if (this.#waiters.length > 0) {
+          this.#waiters.shift().resolve(data);
+        } else {
+          this.#queue.push(data);
+          this.#queuedBytes += data.byteLength;
+        }
+        // Inbound data answers the liveness question as conclusively as a pong.
+        this.#pingSentAt = null;
+      }
+    } catch (err) {
+      this.#finish(err);
+    }
+  }
+
+  async #datagramPump() {
+    const readable = this.#wt.datagrams?.readable;
+    if (!readable) return;
+    const reader = readable.getReader();
+    try {
+      while (!this.#closed) {
+        const { value, done } = await reader.read();
+        if (done) return;
+        this.#handleControl(new TextDecoder().decode(value));
+      }
+    } catch {
+      // Losing the datagram channel costs latency reporting, not the
+      // connection: the stream carries the data.
+    }
+  }
+
+  #handleControl(text) {
+    if (text.startsWith("pong:")) {
+      this.#pingSentAt = null;
+      const ts = parseFloat(text.slice(5));
+      if (!Number.isNaN(ts)) {
+        this.#latency = performance.now() - ts;
+        this.onLatency?.(this.#latency);
+      }
+    }
+  }
+
+  #finish(err) {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#closeErr = err ?? null;
+    this.#stopPing();
+    // A parked pump would otherwise hold the last reference to this reader.
+    if (this.#resume) {
+      const resume = this.#resume;
+      this.#resume = null;
+      resume();
+    }
+    for (const w of this.#waiters) {
+      if (err) w.reject(err);
+      else w.resolve(null);
+    }
+    this.#waiters = [];
+  }
+
+  /**
+   * Ping now and restart the staleness window. See WSConn.ping: a caller that
+   * knows wall-clock passed while nothing here was running needs both halves.
+   */
+  ping() {
+    if (!this.#sendPing()) return;
+    this.#pingSentAt = performance.now();
+  }
+
+  #sendPing() {
+    const writable = this.#wt.datagrams?.writable;
+    if (!writable) return false;
+    try {
+      this.#datagramWriter ??= writable.getWriter();
+      this.#datagramWriter.write(
+        new TextEncoder().encode("ping:" + performance.now()),
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  #startPing() {
+    this.#pingTimer = setInterval(() => {
+      if (this.#stale()) {
+        void this.close();
+        return;
+      }
+      if (this.#sendPing() && this.#pingSentAt === null) {
+        this.#pingSentAt = performance.now();
+      }
+    }, this.#pingInterval);
+  }
+
+  #stale() {
+    if (this.#pingSentAt === null) return false;
+    // Data the caller has not read yet is evidence the peer was alive, and
+    // stops the watchdog closing a working connection under a slow consumer.
+    if (this.#queue.length > 0) return false;
+    return performance.now() - this.#pingSentAt > this.#pongTimeout;
+  }
+
+  #stopPing() {
+    if (this.#pingTimer) {
+      clearInterval(this.#pingTimer);
+      this.#pingTimer = null;
+    }
+  }
+
+  get latency() {
+    return this.#latency;
+  }
+  get transport() {
+    return "wt";
   }
   get url() {
     return this.#url;

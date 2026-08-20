@@ -18,6 +18,9 @@ import (
 
 const defaultMaxPostBytes int64 = 1 << 20 // 1 MiB
 
+// ErrServerClosed is returned by Accept and Push after the server is closed.
+var ErrServerClosed = errors.New("webdial: server closed")
+
 type Server struct {
 	// KeepAlive is the interval between keep-alive pings.
 	// Zero means 25 seconds. Negative means disabled.
@@ -73,7 +76,41 @@ func (s *Server) Accept() (net.Conn, error) {
 	case conn := <-s.acceptCh:
 		return conn, nil
 	case <-s.closed:
-		return nil, errors.New("webdial: server closed")
+		return nil, ErrServerClosed
+	}
+}
+
+// Push hands an externally established connection to a caller of Accept, so a
+// single Accept loop can serve transports implemented outside this package.
+//
+// It blocks until the connection is accepted, ctx is done, or the server is
+// closed. In the latter two cases Push closes conn and returns a non-nil
+// error: a caller must never be left holding a connection nothing will read.
+func (s *Server) Push(ctx context.Context, conn net.Conn) error {
+	// A select chooses uniformly among ready cases, so a closed server with a
+	// free queue slot would still swallow roughly half of all pushes. Settle
+	// both terminal states first to make the documented guarantee hold.
+	select {
+	case <-s.closed:
+		conn.Close()
+		return ErrServerClosed
+	default:
+	}
+	select {
+	case <-ctx.Done():
+		conn.Close()
+		return ctx.Err()
+	default:
+	}
+	select {
+	case s.acceptCh <- conn:
+		return nil
+	case <-ctx.Done():
+		conn.Close()
+		return ctx.Err()
+	case <-s.closed:
+		conn.Close()
+		return ErrServerClosed
 	}
 }
 
@@ -86,11 +123,25 @@ func (s *Server) Close() error {
 			s.sessions.Delete(key)
 			return true
 		})
+		// Connections queued but never accepted can no longer reach a caller,
+		// so closing the server has to release them too.
+		for {
+			select {
+			case conn := <-s.acceptCh:
+				conn.Close()
+			default:
+				return
+			}
+		}
 	})
 	return nil
 }
 
-func (s *Server) keepAliveInterval() time.Duration {
+// KeepAliveInterval reports the effective keep-alive interval: KeepAlive, or 25
+// seconds when it is zero. A negative value means keep-alives are disabled.
+// Transports implemented in other packages use it to match this server's
+// heartbeat pacing.
+func (s *Server) KeepAliveInterval() time.Duration {
 	if s.KeepAlive == 0 {
 		return 25 * time.Second
 	}
@@ -126,7 +177,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	conn := newWSConn(ws, s.keepAliveInterval(), s.compressionLevel(), s.writeTimeout())
+	conn := newWSConn(ws, s.KeepAliveInterval(), s.compressionLevel(), s.writeTimeout())
 	select {
 	case s.acceptCh <- conn:
 	case <-s.closed:
@@ -167,7 +218,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		conn.Close()
 		return
 	}
-	ka := s.keepAliveInterval()
+	ka := s.KeepAliveInterval()
 	if ka < 0 {
 		select {
 		case <-r.Context().Done():

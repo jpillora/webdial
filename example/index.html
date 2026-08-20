@@ -20,6 +20,7 @@
   <label><input type="radio" name="transport" value="auto" checked> auto</label>
   <label><input type="radio" name="transport" value="ws"> ws</label>
   <label><input type="radio" name="transport" value="sse"> sse</label>
+  <label><input type="radio" name="transport" value="wt"> wt</label>
 </fieldset>
 <button id="connect">Connect</button>
 <span id="status"></span>
@@ -49,12 +50,40 @@ function appendLog(cls, text) {
   log.scrollTop = log.scrollHeight;
 }
 
+function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+}
+
+// WebTransport needs the HTTP/3 listener, which is on a different (UDP) port,
+// and a certificate the browser will accept. The devserver publishes both.
+async function webtransportOpts() {
+  const info = await (await fetch("/wt.json")).json();
+  return {
+    transport: "wt",
+    wtURL: info.url,
+    wt: {
+      serverCertificateHashes: [
+        { algorithm: "sha-256", value: hexToBytes(info.hash) },
+      ],
+    },
+  };
+}
+
 connectBtn.onclick = async () => {
   const transport = document.querySelector('input[name="transport"]:checked').value;
-  const opts = transport === "auto" ? {} : { transport };
   connectBtn.disabled = true;
   statusEl.textContent = "connecting...";
   try {
+    const opts =
+      transport === "auto"
+        ? {}
+        : transport === "wt"
+          ? await webtransportOpts()
+          : { transport };
     conn = await dial(location.origin + "/wd/", opts);
     statusEl.textContent = `connected (${conn.transport})`;
     appendLog("info", `connected via ${conn.transport}`);

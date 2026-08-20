@@ -1,7 +1,7 @@
 {
   "name": "webdial",
   "version": "0.1.0",
-  "description": "net.Conn-style stream over HTTP for the browser and Node.js — WebSocket with SSE+POST fallback, zero dependencies",
+  "description": "net.Conn-style stream over HTTP for the browser and Node.js — WebSocket with SSE+POST fallback and opt-in WebTransport, zero dependencies",
   "type": "module",
   "exports": "./client.mjs",
   "files": [
@@ -12,6 +12,8 @@
   "keywords": [
     "websocket",
     "sse",
+    "webtransport",
+    "http3",
     "server-sent-events",
     "net.conn",
     "stream",

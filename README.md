@@ -1,6 +1,7 @@
 # webdial
 
 `net.Conn` over HTTP. Uses WebSocket when available, falls back to SSE+POST.
+WebTransport (HTTP/3) is available opt-in.
 
 ![screenshot](screenshot.png)
 
@@ -81,6 +82,47 @@ Cross-origin WebSockets should also be protected with explicit authentication.
 Avoid a blanket `return true`: browsers do not apply CORS protections to
 WebSocket handshakes.
 
+#### WebTransport (HTTP/3)
+
+WebTransport lives in a subpackage so that programs using only WebSocket and
+SSE do not link quic-go:
+
+```
+go get github.com/jpillora/webdial/wt
+```
+
+Importing only `webdial` links no quic-go code and adds nothing to your
+`go.sum`; quic-go appears in the module graph, so manifest-based scanners may
+list it. Adding WebTransport costs roughly 2 MB of stripped binary.
+
+It needs its own listener, because HTTP/3 runs over UDP. Point it at the same
+core server and one `Accept` loop serves every transport:
+
+```go
+srv := webdial.NewServer()
+
+mux := http.NewServeMux()
+mux.Handle("/wd/", srv)
+go http.ListenAndServe(":8080", mux) // ws + sse
+
+wts := wt.NewServer(srv)
+wts.Addr = ":8443"
+wts.TLSConfig = myTLSConfig
+h3 := http.NewServeMux()
+h3.Handle("/wd/", wts)
+wts.Handler = h3
+go wts.ListenAndServe() // webtransport, same Accept loop
+```
+
+`wt.Server` answers WebTransport itself and delegates every other request to
+the core server, so the same endpoint also serves the SSE fallback over
+HTTP/3. It honours `CheckOrigin` with the same secure default as WebSocket,
+and inherits the core server's keep-alive interval as the QUIC keep-alive
+period.
+
+Because a WebTransport session lives only as long as its CONNECT stream, the
+handler blocks until the session ends; this is handled internally.
+
 ### Client
 
 ```go
@@ -98,6 +140,17 @@ fmt.Println(string(buf[:n])) // "hello"
 ```
 
 `Dial` tries WebSocket first and falls back to SSE+POST automatically. The returned `net.Conn` works the same regardless of transport.
+
+WebTransport is reached through its own entry point, since the root package
+does not import quic-go:
+
+```go
+conn, err := wt.Dial(ctx, "https://localhost:8443/wd/")
+```
+
+Use `wt.Dialer` to supply a `TLSConfig` — for example to trust a development
+certificate. Note the HTTP/3 endpoint is usually on a different port from the
+HTTP one, even when the path is identical.
 
 As with `net.Dialer.DialContext`, `ctx` controls connection establishment only. Canceling it after `Dial` returns does not close the established connection; call `conn.Close()` to end the connection.
 
@@ -142,14 +195,46 @@ await conn.close();
 
 ### Options
 
-Force a specific transport:
+Force a specific transport, or give an ordered list to try in turn:
 
 ```js
 const conn = await dial(url, { transport: "ws" });  // WebSocket only
 const conn = await dial(url, { transport: "sse" }); // SSE+POST only
+const conn = await dial(url, { transport: ["wt", "ws", "sse"] });
 ```
 
 By default, `dial` tries WebSocket first and falls back to SSE+POST.
+An unrecognised transport name throws a `TypeError`.
+
+WebTransport is opt-in and never tried automatically: it needs an HTTP/3
+listener on a separate UDP port, so probing it would cost every dial a failed
+connection attempt wherever it is not deployed — and in the restrictive
+networks this library exists for, that failure only arrives after a QUIC
+handshake timeout.
+
+Because the HTTP/3 listener is usually on another port, `wtURL` overrides the
+endpoint while `conn.url` keeps reporting the URL you passed. `wt` is handed
+to the `WebTransport` constructor:
+
+```js
+const conn = await dial("https://example.com/wd/", {
+  transport: "wt",
+  wtURL: "https://example.com:8443/wd/",
+  wt: { serverCertificateHashes: [{ algorithm: "sha-256", value: hashBytes }] },
+});
+```
+
+WebTransport applies real back-pressure: when unread data reaches
+`maxBufferedBytes` the client stops reading from the stream, which slows the
+sender through QUIC flow control instead of failing the connection the way SSE
+must.
+
+Browser support is Chromium-based browsers and Firefox; `dial` reports
+`webdial: WebTransport is not supported` where the API is missing, so a
+transport list falls through to the next entry. `serverCertificateHashes`,
+used to pin a self-signed development certificate, is Chromium-only and
+requires an ECDSA P-256 certificate valid for no more than two weeks — see
+`testdata/devserver` for a working example.
 
 The SSE transport decodes control events in the background, so keep-alives and
 remote closes are handled even when the application is not calling `read()`.
@@ -169,7 +254,7 @@ SSE receive-buffer error, and subsequent writes report a closed connection.
 
 ### Connection properties
 
-- `conn.transport` — `"ws"` or `"sse"`
+- `conn.transport` — `"ws"`, `"sse"` or `"wt"`
 - `conn.url` — the base URL used to connect
 
 ## Transports
@@ -178,8 +263,9 @@ SSE receive-buffer error, and subsequent writes report a closed connection.
 |-----------|-----------|--------|-------------|
 | `ws` | WebSocket | native | WebSocket support |
 | `sse` | Server-Sent Events (read) + POST (write) | base64 | HTTP/1.1+ |
+| `wt` | WebTransport bidirectional stream (HTTP/3) | native | HTTP/3 listener, HTTPS |
 
-WebSocket is preferred. SSE+POST is the fallback for environments where WebSocket connections are blocked (e.g. some corporate proxies).
+WebSocket is preferred. SSE+POST is the fallback for environments where WebSocket connections are blocked (e.g. some corporate proxies). WebTransport is opt-in on both clients: it needs a separate HTTP/3 listener, and UDP is exactly what the restrictive networks SSE exists for tend to block.
 
 ## Protocol
 
@@ -188,3 +274,15 @@ The server is a single `http.Handler` that routes by content-negotiation:
 - `Upgrade: websocket` header — WebSocket upgrade, binary frames carry data
 - `GET` with `Accept: text/event-stream` — SSE stream; first event is `sid` (session ID), subsequent `d` events carry base64-encoded data, `close` event signals shutdown
 - `POST` with `?s=<sid>` — write body bytes to the session; append `&close=1` to close
+
+WebTransport is served from a separate HTTP/3 listener on the same path:
+
+- HTTP/3 extended `CONNECT` — establishes the session; routing keys on the
+  method alone, since the protocol token differs between drafts
+- one client-initiated bidirectional stream carries the byte stream, with no
+  framing and no base64
+- datagrams carry `ping:<ts>`/`pong:<ts>`, the same control vocabulary the
+  WebSocket transport puts in text frames; the peer echoes the timestamp so
+  the client can measure latency
+- QUIC PING frames provide the keep-alive, so there is no webdial-level server
+  heartbeat, matching WebSocket

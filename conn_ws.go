@@ -15,6 +15,10 @@ import (
 // not going to benefit from us buffering more.
 const pongQueue = 4
 
+// maxControlFrame bounds an application-level text control frame. They carry
+// "ping:<ts>" and nothing else, so this is generous.
+const maxControlFrame = 1 << 10
+
 type wsConn struct {
 	ws           *websocket.Conn
 	reader       io.Reader
@@ -77,7 +81,10 @@ func (c *wsConn) Read(b []byte) (int, error) {
 				return 0, err
 			}
 			if mt == websocket.TextMessage {
-				ctrl, _ := io.ReadAll(r)
+				// Bounded: these are tiny "ping:<ts>" control frames, and an
+				// unbounded ReadAll here lets one peer allocate whatever it
+				// declares.
+				ctrl, _ := io.ReadAll(io.LimitReader(r, maxControlFrame))
 				c.handleControl(ctrl)
 				continue
 			}
@@ -104,10 +111,11 @@ func (c *wsConn) Read(b []byte) (int, error) {
 // stray tail, and typically discards both. Draining the message into the
 // caller's buffer makes a Read yield a whole message whenever it fits.
 //
-// A message larger than b still spans Reads, exactly as before, so consumers
-// treating the conn as a byte stream are unaffected. Consumers that need whole
-// messages must therefore pass a buffer at least as large as their maximum
-// frame.
+// A message larger than b still spans Reads, so consumers treating the conn as
+// a byte stream keep working — but note this now blocks until b is full or the
+// message ends, where before it returned as soon as any bytes were buffered.
+// Consumers that need whole messages must pass a buffer at least as large as
+// their maximum frame.
 func (c *wsConn) fill(b []byte) (int, error) {
 	n := 0
 	for n < len(b) {
@@ -117,7 +125,10 @@ func (c *wsConn) fill(b []byte) (int, error) {
 			return n, err
 		}
 		if m == 0 {
-			break
+			// A reader making no progress without an error would spin here, and
+			// every known consumer treats a short read as "try again" — so fail
+			// loudly rather than hand back a silent hang.
+			return n, io.ErrNoProgress
 		}
 	}
 	return n, nil
