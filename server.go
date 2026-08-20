@@ -1,7 +1,6 @@
 package webdial
 
 import (
-	"bytes"
 	"compress/flate"
 	"context"
 	"errors"
@@ -296,21 +295,22 @@ func (s *Server) handlePostData(w http.ResponseWriter, r *http.Request, sess *ss
 	}
 	defer sess.releasePost()
 
-	var body io.Reader = r.Body
+	var delivered bool
+	var err error
 	if limit >= 0 {
-		body = http.MaxBytesReader(w, r.Body, limit)
 		// Buffer bounded bodies before delivery. Besides enforcing the limit for
 		// chunked or dishonest requests, this prevents a rejected request from
 		// contaminating the connection with a successfully delivered prefix.
-		buffered, err := io.ReadAll(body)
+		var buffered []byte
+		buffered, err = io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
 		if err != nil {
 			writePostReadError(w, err)
 			return
 		}
-		body = bytes.NewReader(buffered)
+		delivered, err = deliverWholeBody(r.Context(), sess.conn, buffered)
+	} else {
+		delivered, err = deliverPostBody(r.Context(), sess.conn, r.Body)
 	}
-
-	delivered, err := deliverPostBody(r.Context(), sess.conn, body)
 	if err == nil {
 		err = r.Context().Err()
 	}
@@ -326,6 +326,29 @@ func (s *Server) handlePostData(w http.ResponseWriter, r *http.Request, sess *ss
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// deliverWholeBody hands the peer one message per POST.
+//
+// A POST is one message on the wire, and the boundary is the sender's. Reading
+// it out in fixed slices would hand the peer read boundaries it never chose,
+// which silently breaks any framing layered on top — a type byte at the front
+// of each message, a length prefix — because every piece after the first begins
+// with payload where the header belongs. The websocket transport already keeps
+// a message whole per Read (see wsConn.fill); this is the same guarantee for
+// the SSE fallback.
+func deliverWholeBody(ctx context.Context, conn *sseServerConn, body []byte) (bool, error) {
+	if len(body) == 0 {
+		return false, nil
+	}
+	if err := conn.deliver(ctx, body); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// deliverPostBody streams an unbounded body, which cannot preserve the sender's
+// message boundary: nothing has read it all, so there is no way to know where it
+// ends. Only a server that has opted out of MaxPostBytes takes this path, and
+// such a server is by definition treating the connection as a byte stream.
 func deliverPostBody(ctx context.Context, conn *sseServerConn, body io.Reader) (bool, error) {
 	delivered := false
 	for {
