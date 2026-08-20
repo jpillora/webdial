@@ -83,7 +83,7 @@ func (c *wsConn) Read(b []byte) (int, error) {
 			}
 			c.reader = r
 		}
-		n, err := c.reader.Read(b)
+		n, err := c.fill(b)
 		if err == io.EOF {
 			c.reader = nil
 			if n > 0 {
@@ -93,6 +93,34 @@ func (c *wsConn) Read(b []byte) (int, error) {
 		}
 		return n, err
 	}
+}
+
+// fill reads as much of the current message as b holds.
+//
+// Gorilla's message reader is a stream: one Read returns only what its internal
+// buffer (4096 bytes by default) currently holds, so a larger message arrives
+// split across several Reads. Every consumer that parses one frame per Read —
+// a length-prefixed frame, a JSON object — then sees a truncated head and a
+// stray tail, and typically discards both. Draining the message into the
+// caller's buffer makes a Read yield a whole message whenever it fits.
+//
+// A message larger than b still spans Reads, exactly as before, so consumers
+// treating the conn as a byte stream are unaffected. Consumers that need whole
+// messages must therefore pass a buffer at least as large as their maximum
+// frame.
+func (c *wsConn) fill(b []byte) (int, error) {
+	n := 0
+	for n < len(b) {
+		m, err := c.reader.Read(b[n:])
+		n += m
+		if err != nil {
+			return n, err
+		}
+		if m == 0 {
+			break
+		}
+	}
+	return n, nil
 }
 
 func (c *wsConn) Write(b []byte) (int, error) {
