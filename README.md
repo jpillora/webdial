@@ -141,6 +141,31 @@ fmt.Println(string(buf[:n])) // "hello"
 
 `Dial` tries WebSocket first and falls back to SSE+POST automatically. The returned `net.Conn` works the same regardless of transport.
 
+#### Deadlines
+
+Read deadlines behave as `net.Conn` requires on every transport: a fired one
+ends that `Read` with an error satisfying `errors.Is(err, os.ErrDeadlineExceeded)`
+and leaves the connection usable, so the usual idle-timeout loop works.
+
+```go
+for {
+    conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+    n, err := conn.Read(buf)
+    if errors.Is(err, os.ErrDeadlineExceeded) {
+        continue // idle, not broken
+    }
+    ...
+}
+```
+
+On WebSocket, where a `Read` returns a whole message when it fits, a read
+deadline can expire after part of a message has arrived; no byte is lost, and
+the next `Read` yields the complete message.
+
+A fired *write* deadline on WebSocket is terminal, deliberately: the timed-out
+write has already put a partial frame on the wire, leaving the peer's parser
+desynchronised, so there is no resume point.
+
 WebTransport is reached through its own entry point, since the root package
 does not import quic-go:
 
