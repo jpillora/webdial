@@ -1,0 +1,40 @@
+name: Publish NPM
+on:
+  push:
+    tags:
+      - 'v*'
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Test
+        # The Go-backed suites (client_test.mjs, watchdog_test.mjs) need a
+        # toolchain and a live server; these run the client standalone.
+        run: |
+          node url_test.mjs
+          node sse_pump_test.mjs
+          node wt_test.mjs
+      - name: Verify the package installs and imports
+        run: |
+          mkdir -p /tmp/pack /tmp/smoke
+          npm pack --pack-destination /tmp/pack
+          cd /tmp/smoke
+          npm init -y
+          npm install /tmp/pack/*.tgz
+          echo 'import { dial } from "webdial"; if (typeof dial !== "function") throw new Error("dial missing"); console.log("ESM import works!");' > test.mjs
+          node test.mjs
+      - name: Publish package
+        run: |
+          npm install -g npm@latest
+          VERSION=${GITHUB_REF_NAME#v}
+          sed -i "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" package.json
+          npm publish --access public --provenance
