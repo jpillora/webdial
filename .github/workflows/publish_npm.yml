@@ -4,7 +4,12 @@ on:
     tags:
       - 'v*'
 jobs:
+  # A release runs the full suite; publish only happens if it passes.
+  test:
+    uses: ./.github/workflows/test.yml
+
   publish:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -16,13 +21,6 @@ jobs:
         with:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
-      - name: Test
-        # The Go-backed suites (client_test.mjs, watchdog_test.mjs) need a
-        # toolchain and a live server; these run the client standalone.
-        run: |
-          node url_test.mjs
-          node sse_pump_test.mjs
-          node wt_test.mjs
       - name: Verify the package installs and imports
         run: |
           mkdir -p /tmp/pack /tmp/smoke

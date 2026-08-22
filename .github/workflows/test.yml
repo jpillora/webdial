@@ -1,0 +1,48 @@
+name: Test
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Called by Publish NPM so a release runs exactly the same suite.
+  workflow_call:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: Vet
+        # testdata is invisible to ./..., so the helper servers are named.
+        run: |
+          go vet ./...
+          go vet ./testdata/devserver ./testdata/echoserver ./testdata/silentserver
+      - name: Go tests
+        env:
+          QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING: '1'
+        run: go test -race ./...
+      - name: JS tests
+        # client_test.mjs and watchdog_test.mjs spawn a Go server, so they need
+        # the toolchain set up above.
+        run: |
+          node url_test.mjs
+          node sse_pump_test.mjs
+          node wt_test.mjs
+          node client_test.mjs
+          node watchdog_test.mjs
