@@ -55,6 +55,21 @@ try {
     await conn.close();
     console.log(`  pass (${frames} frames, no pong)`);
 
+    if (transport === "ws") {
+      console.log("test ws active traffic suppresses redundant probes...");
+      conn = await dial(`${url}/talking?rejectPing=1`, opts);
+      const activeDeadline = Date.now() + PING_MS * 5;
+      let activeFrames = 0;
+      while (Date.now() < activeDeadline) {
+        const data = await conn.read();
+        assert.notEqual(data, null, `connection closed after redundant ping with ${activeFrames} active frames`);
+        activeFrames++;
+      }
+      assert.ok(activeFrames > 10, `expected continuous active traffic, got ${activeFrames} frames`);
+      await conn.close();
+      console.log("  pass");
+    }
+
     console.log(`test ${transport} finite data does not disable the watchdog...`);
     conn = await dial(`${url}/burst`, opts);
     const frame = await Promise.race([

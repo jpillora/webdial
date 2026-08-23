@@ -128,6 +128,7 @@ class WSConn {
   #latency = null;
   #pingTimer = null;
   #pingSentAt = null;
+  #lastRecvAt = 0;
   #pingInterval = PING_INTERVAL_MS;
   #pongTimeout = PONG_TIMEOUT_MS;
   onLatency = null;
@@ -138,6 +139,7 @@ class WSConn {
     this.#pingInterval = opts?.pingIntervalMs ?? PING_INTERVAL_MS;
     this.#pongTimeout = opts?.pongTimeoutMs ?? this.#pingInterval * 3;
     ws.onmessage = (event) => {
+      this.#lastRecvAt = performance.now();
       if (typeof event.data === "string") {
         this.#handleControl(event.data);
         return;
@@ -230,9 +232,11 @@ class WSConn {
         this.#ws.close();
         return;
       }
+      const now = performance.now();
+      if (now - this.#lastRecvAt < this.#pingInterval) return;
       try {
-        this.#ws.send("ping:" + performance.now());
-        if (this.#pingSentAt === null) this.#pingSentAt = performance.now();
+        this.#ws.send("ping:" + now);
+        if (this.#pingSentAt === null) this.#pingSentAt = now;
       } catch {}
     }, this.#pingInterval);
   }

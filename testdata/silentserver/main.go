@@ -15,6 +15,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 	"net/http"
@@ -25,9 +26,14 @@ import (
 
 var upgrader = websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 
-func drainReads(ws *websocket.Conn) {
+func drainReads(ws *websocket.Conn, rejectPing bool) {
 	for {
-		if _, _, err := ws.ReadMessage(); err != nil {
+		mt, data, err := ws.ReadMessage()
+		if err != nil {
+			return
+		}
+		if rejectPing && mt == websocket.TextMessage && bytes.HasPrefix(data, []byte("ping:")) {
+			ws.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "unexpected ping"), time.Now().Add(time.Second))
 			return
 		}
 	}
@@ -39,7 +45,7 @@ func talking(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer ws.Close()
-	go drainReads(ws)
+	go drainReads(ws, r.URL.Query().Get("rejectPing") == "1")
 	tick := time.NewTicker(20 * time.Millisecond)
 	defer tick.Stop()
 	for range tick.C {
@@ -55,7 +61,7 @@ func silent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer ws.Close()
-	drainReads(ws)
+	drainReads(ws, false)
 }
 
 func burst(w http.ResponseWriter, r *http.Request) {
@@ -68,7 +74,7 @@ func burst(w http.ResponseWriter, r *http.Request) {
 	if err := ws.WriteMessage(websocket.BinaryMessage, []byte("frame")); err != nil {
 		return
 	}
-	drainReads(ws)
+	drainReads(ws, false)
 }
 
 func sse(mode string, w http.ResponseWriter, r *http.Request) {
